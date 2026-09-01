@@ -24,7 +24,6 @@ Author : Florian Scalvini
 import numpy as np
 import torch
 import torchio as tio
-import vtk
 from torchio import transforms
 
 
