@@ -1,0 +1,12 @@
+name: 'ferret'
+root_dir: /home/florian/Documents/Dataset/OHSU_Ferret_Atlas/Ferret_affine/Ferret_crop/
+train_json: data.json
+val_json: data.json
+label_metadata: labels_metadata.json
+gi_normalized: gi.csv
+t0: 8
+tn: 38
+csize: [ 128, 192, 96 ]
+rsize: [ 128, 192, 96 ]
+date_format: null
+num_classes: 15

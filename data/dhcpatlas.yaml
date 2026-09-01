@@ -1,0 +1,13 @@
+name: 'dhcpatlas'
+root_dir: /home/florian/Documents/Dataset/dHCP/Atlas/
+train_json: data.json
+val_json: data.json
+label_metadata: labels_metadata.json
+gi_normalized: gi.csv
+t0: 21
+tn: 36
+num_classes: 20
+date_format: null
+csize: [ 192, 224, 192 ]
+rsize: [ 192, 224, 192 ]
+load_surface: true

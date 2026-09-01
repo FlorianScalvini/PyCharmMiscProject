@@ -1,0 +1,13 @@
+name: 'macaque'
+root_dir: /home/florian/Documents/Dataset/AtlasImages/AtlasImages_affine/
+train_json: data.json
+val_json: data.json
+label_metadata: labels_metadata.json
+gi_normalized: gi.csv
+t0: 85
+tn: 155
+num_classes: 20
+date_format: null
+csize: [ 128, 160, 128 ]
+rsize: [ 128, 160, 128 ]
+

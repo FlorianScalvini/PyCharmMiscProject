@@ -1,0 +1,12 @@
+name: 'ADNI'
+root_dir: /media/florian/SamsungDisk/Postdoc/Datasets/ADNI
+train_json: data_train.json
+val_json: data_val.json
+gi_normalized: null
+t0: 0
+tn: 0
+date_format: null
+csize: [ 192, 224, 224 ]
+rsize: [ 192, 224, 224 ]
+
+

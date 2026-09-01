@@ -1,0 +1,13 @@
+name: 'dhcpsubject'
+root_dir: /home/florian/Documents/Dataset/dHCP/Subject/
+train_json: fmri_data_train.json
+val_json: fmri_data_val.json
+label_metadata: labels_metadata.json
+gi_normalized: null
+t0: 146
+tn: 268
+num_classes: 20
+date_format: null
+csize: [ 192, 224, 192 ]
+rsize: [ 192, 224, 192 ]
+
