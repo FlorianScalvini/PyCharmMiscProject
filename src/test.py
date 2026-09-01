@@ -63,10 +63,6 @@ def main(args: Namespace) -> None:
         json_path_val=config.get("test_json", config["val_json"]),
         batch_size=1,
         num_workers=1,
-        size=config["rsize"],
-        crop=config["csize"],
-        t0=config["t0"],
-        tn=config["tn"],
     )
 
     # --- Model ---

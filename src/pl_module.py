@@ -1,26 +1,18 @@
 # --- Standard library ---
 import os
-import json
-import random
 
 # --- Third-party ---
 import numpy as np
-import nibabel as nib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import monai
 import pytorch_lightning as pl
-import torchio as tio
-from torchvision import transforms
-from torchvision.utils import make_grid
 from torchvision.utils import save_image
-from pytorch_lightning.utilities.types import STEP_OUTPUT
 
 # --- Local ---
 import utils.utils as utils
 import utils.losses as losses
-import utils.visualize as visualize
 import utils.registration as registration
 from model.neural_ode import LongitudinalODERegistration
 
@@ -68,18 +60,13 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.loss_reg = losses.Grad3d('l2')
         self.loss_seg = nn.MSELoss()
 
-        self.seg_metrics = monai.metrics.DiceMetric() # type: ignore
-
         # Logging and tracking best performance
         self.save_dir = save_dir
-        self.max_dice_score = 0
         self.min_intensity_loss = float("inf")
-        self.table_result_data = []
         self.validation_intensity_losses = []
         self.validation_mae_values = []
         self.validation_psnr_values = []
         self.validation_negative_jacobian_percentages = []
-        self.validation_has_segmentation = False
 
         os.makedirs(os.path.join(self.save_dir, "parcellations"), exist_ok=True)
         os.makedirs(os.path.join(self.save_dir, "images"), exist_ok=True)
@@ -204,50 +191,10 @@ class RegistrationLongitudinal(pl.LightningModule):
 
     def on_validation_epoch_start(self) -> None:
         """Reset per-epoch validation accumulators before the validation loop."""
-        self.table_result_data = []
         self.validation_intensity_losses = []
         self.validation_mae_values = []
         self.validation_psnr_values = []
         self.validation_negative_jacobian_percentages = []
-        self.validation_has_segmentation = False
-        self.seg_metrics.reset()
-
-
-    @staticmethod
-    def _validation_reverse_transform(
-        model_shape: tuple[int, int, int],
-        crop_shape: tuple[int, int, int],
-        original_shape: tuple[int, int, int],
-    ) -> tio.transforms.Compose:
-        """Map a validation prediction from model space to its original grid."""
-        inverse = []
-        if tuple(model_shape) != tuple(crop_shape):
-            inverse.append(tio.transforms.Resize(crop_shape))
-        if tuple(crop_shape) != tuple(original_shape):
-            inverse.append(tio.transforms.CropOrPad(original_shape))
-        return tio.transforms.Compose(inverse)
-
-
-    @staticmethod
-    def _save_displacement_nifti(
-        flow_ras_mm: torch.Tensor,
-        affine: np.ndarray,
-        output_path: str,
-    ) -> None:
-        """Save ``(3,I,J,K)`` RAS-mm vectors as a NIfTI displacement field.
-
-        Slicer requires a five-dimensional ``(I,J,K,1,3)`` image with NIfTI
-        intent code 1006 (DISPVECT).  TorchIO's generic multichannel writer
-        uses intent 1007 (VECTOR), which Slicer warns is not a transform.
-        """
-        if flow_ras_mm.ndim != 4 or flow_ras_mm.shape[0] != 3:
-            raise ValueError(
-                f"flow must have shape (3,I,J,K), got {tuple(flow_ras_mm.shape)}"
-            )
-        data = flow_ras_mm.permute(1, 2, 3, 0).unsqueeze(3).numpy()
-        image = nib.Nifti1Image(data.astype(np.float32, copy=False), affine)
-        image.header.set_intent(1006, name="displacement")
-        nib.save(image, output_path)
 
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
@@ -338,12 +285,10 @@ class RegistrationLongitudinal(pl.LightningModule):
                 )
 
         # Reset
-        self.table_result_data = []
         self.validation_intensity_losses = []
         self.validation_mae_values = []
         self.validation_psnr_values = []
         self.validation_negative_jacobian_percentages = []
-        self.seg_metrics.reset()
 
         torch.cuda.empty_cache()
 

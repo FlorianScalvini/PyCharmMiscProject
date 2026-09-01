@@ -168,12 +168,6 @@ def parse_args() -> Namespace:
         help="Number of sanity validation steps before training starts.",
     )
     parser.add_argument(
-        "--limit_val_batches",
-        type=int,
-        default=5,
-        help="Maximum validation sequences per validation epoch (default: 5).",
-    )
-    parser.add_argument(
         "--check_val_every_n_epoch",
         type=int,
         default=20,
@@ -225,8 +219,6 @@ def main(args: Namespace) -> None:
         json_path_val=config["val_json"],
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        size=config["rsize"],
-        crop=config["csize"],
     )
 
     # --- Model ---
@@ -246,7 +238,6 @@ def main(args: Namespace) -> None:
         max_epochs=args.max_epochs,
         precision=args.precision,
         num_sanity_val_steps=args.num_sanity_val_steps,
-        limit_val_batches=args.limit_val_batches,
         logger=tensorboard_logger,
         callbacks=[
             ModelCheckpoint(

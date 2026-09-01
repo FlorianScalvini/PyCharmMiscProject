@@ -55,13 +55,9 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         data: list,
-        transform: transforms.Transform | None = None,
-        augmentation: transforms.Transform | None = None,
         has_segmentation: bool = True,
     ) -> None:
         super().__init__()
-        self.transform = transform
-        self.augmentation = augmentation
         self.has_segmentation = has_segmentation
         self.data: list = []
         for i in range(len(data)):
@@ -102,10 +98,6 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
             if self.has_segmentation:
                 images["label"] = tio.LabelMap(data[i][1])
             session = tio.Subject(**images)
-            if self.transform is not None:
-                session = self.transform(session)
-            if self.augmentation is not None:
-                session = self.augmentation(session) # type: ignore
             mri_stack.append(session.image.data)
             has_seg = self.has_segmentation
             has_seg_stack.append(has_seg)
@@ -154,15 +146,10 @@ class SpatioTemporalDatasetValidation(torch.utils.data.Dataset):
     def __init__(
         self,
         data: list,
-        transform: transforms.Transform | None = None,
-        transform_seg: transforms.Transform | None = None,
-        reverse_transform: transforms.Transform | None = None,
         has_segmentation: bool = True,
         endpoints_only: bool = False,
     ) -> None:
         super().__init__()
-        self.transform = transform
-        self.transform_seg = transform_seg
         self.has_segmentation = has_segmentation
         self.data = []
         for subject in data:
@@ -174,14 +161,12 @@ class SpatioTemporalDatasetValidation(torch.utils.data.Dataset):
                 if endpoints_only
                 else sorted_subject
             )
-        self.reverse_transform = reverse_transform
+
+
     def __len__(self) -> int:
         """Return the number of subjects in the dataset."""
         return len(self.data)
 
-    def get_reverse_transform(self) -> transforms.Transform | None:
-        """Return the inverse spatial transform, or ``None`` if not set."""
-        return self.reverse_transform
 
 
     def get_subject(self, idx_subject: int, idx_session: int) -> tio.Subject:
@@ -237,9 +222,6 @@ class SpatioTemporalDatasetValidation(torch.utils.data.Dataset):
             if self.has_segmentation:
                 images["label"] = tio.LabelMap(data[i][1])
             session = tio.Subject(**images)
-            if self.transform is not None:
-                session = self.transform(session)
-
             mri_stack.append(session.image.data)
             has_seg = self.has_segmentation
             has_seg_stack.append(has_seg)
