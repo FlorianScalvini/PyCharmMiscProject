@@ -90,29 +90,25 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
         mri_stack = []
         time_stack = []
         seg_stack = []
-        has_seg_stack = []
         data = self.data[idx]
         for i in range(len(data)):
-            images = {"image": tio.ScalarImage(data[i][0])}
+            image = tio.ScalarImage(data[i][0]).data
+            mri_stack.append(image)
             if self.has_segmentation:
-                images["label"] = tio.LabelMap(data[i][1])
-            session = tio.Subject(**images)
-            mri_stack.append(session.image.data)
-            has_seg = self.has_segmentation
-            has_seg_stack.append(has_seg)
-            seg_stack.append(
-                session.label.data
-                if has_seg
-                else torch.zeros_like(session.image.data, dtype=torch.long)
-            )
+                seg_stack.append(tio.LabelMap(data[i][1]).data)
             time_stack.append(data[i][2])
-            del session
 
         # ── 5. stack ──────────────────────────────────────────────────
         mri_stack_out = torch.stack(mri_stack, dim=0)  # (T_total, 1, X, Y, Z)
-        seg_stack_out = torch.stack(seg_stack, dim=0)  # (T_total, 1, X, Y, Z)
+        seg_stack_out = (
+            torch.stack(seg_stack, dim=0)
+            if self.has_segmentation
+            else torch.empty(0)
+        )
         time_stack_out = torch.tensor(time_stack, dtype=torch.float)  # (T_total,)
-        has_seg_out = torch.tensor(has_seg_stack, dtype=torch.bool)
+        has_seg_out = torch.full(
+            (len(data),), self.has_segmentation, dtype=torch.bool
+        )
 
         return mri_stack_out, seg_stack_out, time_stack_out, has_seg_out
 
@@ -213,30 +209,26 @@ class SpatioTemporalDatasetValidation(torch.utils.data.Dataset):
         """
         mri_stack = []
         seg_stack = []
-        has_seg_stack = []
         time_stack = []
         data = self.data[idx]
         for i in range(len(data)):
-            images = {"image": tio.ScalarImage(data[i][0])}
+            image = tio.ScalarImage(data[i][0]).data
+            mri_stack.append(image)
             if self.has_segmentation:
-                images["label"] = tio.LabelMap(data[i][1])
-            session = tio.Subject(**images)
-            mri_stack.append(session.image.data)
-            has_seg = self.has_segmentation
-            has_seg_stack.append(has_seg)
-            seg_stack.append(
-                session.label.data
-                if has_seg
-                else torch.zeros_like(session.image.data, dtype=torch.long)
-            )
+                seg_stack.append(tio.LabelMap(data[i][1]).data)
             time_stack.append(data[i][2])
-            del session
         mri_stack_out = torch.stack(mri_stack, dim=0)  # (T_total, 1, X, Y, Z)
 
-        seg_stack_out = torch.stack(seg_stack, dim=0)  # (T_total, 1, X, Y, Z)
+        seg_stack_out = (
+            torch.stack(seg_stack, dim=0)
+            if self.has_segmentation
+            else torch.empty(0)
+        )
 
         time_stack_out = torch.tensor(time_stack, dtype=torch.float)  # (T_total,)
-        has_seg_out = torch.tensor(has_seg_stack, dtype=torch.bool)
+        has_seg_out = torch.full(
+            (len(data),), self.has_segmentation, dtype=torch.bool
+        )
         return mri_stack_out, seg_stack_out, time_stack_out, has_seg_out
     
 '''

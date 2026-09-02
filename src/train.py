@@ -79,8 +79,8 @@ def parse_args() -> Namespace:
             Floating-point precision used during training.
         num_sanity_val_steps : int
             Number of sanity validation steps before training starts.
-        check_val_every_n_epoch : int
-            Run validation every N epochs.
+        val_check_interval : int
+            Run validation every N training iterations across epochs.
         checkpoint_every_n_steps : int
             Save a checkpoint every N training steps.
     """
@@ -168,10 +168,10 @@ def parse_args() -> Namespace:
         help="Number of sanity validation steps before training starts.",
     )
     parser.add_argument(
-        "--check_val_every_n_epoch",
+        "--val_check_interval",
         type=int,
-        default=20,
-        help="Run validation every N epochs.",
+        default=100,
+        help="Run validation every N training iterations, across epochs.",
     )
     parser.add_argument(
         "--checkpoint_every_n_steps",
@@ -210,7 +210,12 @@ def main(args: Namespace) -> None:
     os.makedirs(save_dir, exist_ok=True)
 
     # --- Logger ---
-    tensorboard_logger: TensorBoardLogger = TensorBoardLogger(save_dir=save_dir)
+    tensorboard_logger: TensorBoardLogger = TensorBoardLogger(
+        save_dir=save_dir,
+        name="tensorboard",
+        version="metrics",
+        default_hp_metric=False,
+    )
 
     # --- Data module ---
     datamodule: pl.LightningDataModule = SpatioTemporalSequenceDatamoduleJSON(
@@ -247,7 +252,8 @@ def main(args: Namespace) -> None:
             ),
             TQDMProgressBar(refresh_rate=1),
         ],
-        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        val_check_interval=args.val_check_interval,
+        check_val_every_n_epoch=None,
         enable_progress_bar=True,
     )
     trainer.fit(model=training_module, datamodule=datamodule, ckpt_path=args.checkpoint)

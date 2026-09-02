@@ -22,8 +22,8 @@ module load pytorch-gpu
 PROJECT_DIR=/lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject
 cd "$PROJECT_DIR"
 
-lambda_reg_values=(5)
-lambda_jac_values=(100)
+lambda_reg_values=(50)
+lambda_jac_values=(1000)
 
 lambda_reg=${lambda_reg_values[$SLURM_ARRAY_TASK_ID]}
 lambda_jac=${lambda_jac_values[$SLURM_ARRAY_TASK_ID]}
@@ -38,4 +38,4 @@ srun python -u src/train.py \
     --max_epochs 5000 \
     --num_workers "$SLURM_CPUS_PER_TASK" \
     --num_sanity_val_steps 0 \
-    --check_val_every_n_epoch 5
+    --val_check_interval 100

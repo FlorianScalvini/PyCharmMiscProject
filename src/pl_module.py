@@ -167,13 +167,29 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.manual_backward(loss)
         optimizer.step() # type: ignore
 
-        self.log_dict({
-            'loss_G': loss.item(),
-            'loss_sim': (self.lambda_sim * loss_sim).item(),
-            'loss_seg': (self.lambda_seg * loss_seg).item(),
-            'loss_reg': (self.lambda_reg * loss_reg).item(),
-            'loss_jac': (self.lambda_jac * loss_jac).item(),
-        }, on_step=False, on_epoch=True, prog_bar=True)
+        self.log_dict(
+            {
+                "Train/Loss/Similarity": (self.lambda_sim * loss_sim).detach(),
+                "Train/Loss/Segmentation": (self.lambda_seg * loss_seg).detach(),
+                "Train/Loss/Regularization": (self.lambda_reg * loss_reg).detach(),
+                "Train/Loss/Jacobian": (self.lambda_jac * loss_jac).detach(),
+                "Train/Context/SequenceLength": float(images.shape[0]),
+                "Train/Context/TargetIndex": float(target_idx),
+                "Optimization/LearningRate": self.trainer.optimizers[0].param_groups[0]["lr"],
+            },
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            batch_size=1,
+        )
+        self.log(
+            "Train/Loss/Total",
+            loss.detach(),
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            batch_size=1,
+        )
 
         # ── critical: free the ODE trajectory ──
         del all_phi, grid_voxel, loss, loss_sim, loss_reg
@@ -182,6 +198,8 @@ class RegistrationLongitudinal(pl.LightningModule):
 
     def on_train_epoch_end(self) -> None:
         """Flush GPU cache and save a checkpoint at the end of each training epoch."""
+        scheduler = self.lr_schedulers()
+        scheduler.step()  # type: ignore[union-attr]
         torch.cuda.empty_cache()  # ← add this
         torch.save(self.model.state_dict(), os.path.join(self.save_dir, "last_registration.pt"))
 
@@ -233,49 +251,41 @@ class RegistrationLongitudinal(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         """Log aggregated metrics and grid images; save model if a new Dice best is reached."""
-        step = self.current_epoch
-
         if self.validation_intensity_losses:
             mean_intensity_loss = float(np.mean(self.validation_intensity_losses))
             mean_mae = float(np.mean(self.validation_mae_values))
             mean_psnr = float(np.mean(self.validation_psnr_values))
             self.log(
-                "Val/mean_intensity_loss",
+                "Validation/Intensity/LNCC",
                 mean_intensity_loss,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
             )
             self.log(
-                "Val/MAE", mean_mae, on_step=False, on_epoch=True, prog_bar=True
+                "Validation/Intensity/MAE",
+                mean_mae,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
             )
             self.log(
-                "Val/PSNR", mean_psnr, on_step=False, on_epoch=True, prog_bar=True
-            )
-            self.logger.experiment.add_scalar(  # type: ignore
-                "Val/mean_intensity_loss", mean_intensity_loss, global_step=step
-            )
-            self.logger.experiment.add_scalar(  # type: ignore
-                "Val/MAE", mean_mae, global_step=step
-            )
-            self.logger.experiment.add_scalar(  # type: ignore
-                "Val/PSNR", mean_psnr, global_step=step
+                "Validation/Intensity/PSNR",
+                mean_psnr,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
             )
             if self.validation_negative_jacobian_percentages:
                 mean_negative_jacobian = float(
                     np.mean(self.validation_negative_jacobian_percentages)
                 )
                 self.log(
-                    "Val/Jacobian_negative_percent",
+                    "Validation/Deformation/NegativeJacobianPercent",
                     mean_negative_jacobian,
                     on_step=False,
                     on_epoch=True,
                     prog_bar=True,
-                )
-                self.logger.experiment.add_scalar(  # type: ignore
-                    "Val/Jacobian_negative_percent",
-                    mean_negative_jacobian,
-                    global_step=step,
                 )
             if mean_intensity_loss < self.min_intensity_loss:
                 self.min_intensity_loss = mean_intensity_loss

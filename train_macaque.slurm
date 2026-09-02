@@ -38,4 +38,4 @@ srun python -u src/train.py \
     --max_epochs 5000 \
     --num_workers "$SLURM_CPUS_PER_TASK" \
     --num_sanity_val_steps 0 \
-    --check_val_every_n_epoch 10
+    --val_check_interval 100
