@@ -8,5 +8,4 @@ tn: 130
 date_format: null
 csize: [ 192, 192, 192 ]
 rsize: [ 192, 192, 192 ]
-force_last_target: true
 
