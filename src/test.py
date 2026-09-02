@@ -57,19 +57,21 @@ def main(args: Namespace) -> None:
     os.makedirs(save_dir, exist_ok=True)
 
     # --- Data module ---
-    datamodule: pl.LightningDataModule = SpatioTemporalSequenceDatamoduleJSON(
+    datamodule: SpatioTemporalSequenceDatamoduleJSON = SpatioTemporalSequenceDatamoduleJSON(
         root_dir=config["root_dir"],
         json_path=config["train_json"],
         json_path_val=config.get("test_json", config["val_json"]),
         batch_size=1,
         num_workers=1,
+        t0=config["t0"],
+        tn=config["tn"],
     )
 
     # --- Model ---
     training_module: RegistrationLongitudinal = RegistrationLongitudinal(
         save_dir=save_dir,
         shape=config["rsize"],
-        step_time=0.1
+        step_time=0.1,
     )
 
     # --- Trainer ---

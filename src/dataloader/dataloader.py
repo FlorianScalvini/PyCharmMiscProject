@@ -76,6 +76,8 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         json_path_val: str,
         batch_size: int,
         num_workers: int = 4,
+        t0: float = 0.0,
+        tn: float = 1.0,
 
     ) -> None:
         super().__init__()
@@ -88,6 +90,10 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         self.json_path_val = os.path.join(root_dir, json_path_val)
         self.batch_size = batch_size
         self.num_workers = num_workers
+        if tn <= t0:
+            raise ValueError(f"tn must be greater than t0, got t0={t0}, tn={tn}")
+        self.t0 = float(t0)
+        self.age_span = float(tn) - float(t0)
         self.test_subjects = None
         # Images are expected to be spatially preprocessed and intensity
         # normalized offline before training.
@@ -113,10 +119,13 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
             for j in range(len(data['subjects'][i]['sessions'])):
                 segmentation = data['subjects'][i]['sessions'][j].get('segmentation')
                 segmentation_presence.append(segmentation is not None)
+                age = (
+                    float(data['subjects'][i]['sessions'][j]['age']) - self.t0
+                ) / self.age_span
                 session = [
                     resolve_path(data['subjects'][i]['sessions'][j]['image']),
                     resolve_path(segmentation) if segmentation is not None else None,
-                    data['subjects'][i]['sessions'][j]['age'],
+                    age,
                 ]
                 subject.append(session)
 
@@ -132,10 +141,13 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
             for j in range(len(data['subjects'][i]['sessions'])):
                 segmentation = data['subjects'][i]['sessions'][j].get('segmentation')
                 segmentation_presence.append(segmentation is not None)
+                age = (
+                    float(data['subjects'][i]['sessions'][j]['age']) - self.t0
+                ) / self.age_span
                 session = [
                     resolve_path(data['subjects'][i]['sessions'][j]['image']),
                     resolve_path(segmentation) if segmentation is not None else None,
-                    data['subjects'][i]['sessions'][j]['age'],
+                    age,
                 ]
                
                 subject.append(session)

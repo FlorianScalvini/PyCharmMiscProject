@@ -1,13 +1,13 @@
 name: 'babofet'
-root_dir: /home/florian/Documents/Dataset/new_babofet/
+force_last_target: true
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/new_babofet/
 train_json: data_val.json
 val_json: data_val.json
 label_metadata: labels_metadata.json
 gi_normalized: null
-t0: 88
-tn: 161
+t0: 92
+tn: 155
 num_classes: 5
 date_format: null
 csize: [ 192, 224, 128 ]
 rsize: [ 192, 224, 128 ]
-load_surface: true

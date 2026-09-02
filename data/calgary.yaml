@@ -1,11 +1,11 @@
 name: 'Calgary'
-root_dir: /media/florian/SamsungDisk/Postdoc/Datasets/Calgary/
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/Calgary/
 train_json: data_train.json
 val_json: data_val.json
 gi_normalized: null
-t0: 0
-tn: 0
 date_format: null
+t0: 50
+tn: 100
 csize: [ 192, 224, 224 ]
 rsize: [ 192, 224, 224 ]
 

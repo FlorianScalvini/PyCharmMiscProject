@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=joint_seg
+#SBATCH --job-name=macaque
 #SBATCH -A crp@h100
 #SBATCH -C h100
 #SBATCH --nodes=1
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --hint=nomultithread
 #SBATCH --time=10:00:00
-#SBATCH --output=./output/joint_seg_%A_%a.out
-#SBATCH --error=./error/joint_seg_%A_%a.err
+#SBATCH --output=./output/macaque_%A_%a.out
+#SBATCH --error=./error/macaque_%A_%a.err
 #SBATCH --qos=qos_gpu_h100-t3
 #SBATCH --array=0-0
 
@@ -23,7 +23,7 @@ PROJECT_DIR=/lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject
 cd "$PROJECT_DIR"
 
 lambda_reg_values=(0.5)
-lambda_jac_values=(10)
+lambda_jac_values=(8)
 
 lambda_reg=${lambda_reg_values[$SLURM_ARRAY_TASK_ID]}
 lambda_jac=${lambda_jac_values[$SLURM_ARRAY_TASK_ID]}

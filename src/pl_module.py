@@ -39,6 +39,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         lambda_jac: float = 0.000001,
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.1,
+        force_last_target: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -48,13 +49,17 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.automatic_optimization = False
         self.learning_rate = learning_rate
         # Initialize the registration and segmentation networks
-        self.model = LongitudinalODERegistration(shape=shape, step_time=step_time)
+        self.model = LongitudinalODERegistration(
+            shape=shape,
+            step_time=step_time,
+        )
 
         # Hyperparameters
         self.lambda_reg = lambda_reg
         self.lambda_sim = lambda_sim
         self.lambda_seg = lambda_seg
         self.lambda_jac = lambda_jac
+        self.force_last_target = force_last_target
         # Loss functions and metrics
         self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=9) # type: ignore
         self.loss_reg = losses.Grad3d('l2')
@@ -88,7 +93,11 @@ class RegistrationLongitudinal(pl.LightningModule):
         shape = source.shape[2:]
         scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
         all_phi, loss_reg, loss_jac = self.model(
-            source, target, ages, target_age, grid
+            source,
+            target,
+            ages,
+            target_age,
+            grid,
         )
         all_phi = (all_phi + 1.) / 2. * scale_factor
         return all_phi, loss_reg, loss_jac
@@ -119,7 +128,11 @@ class RegistrationLongitudinal(pl.LightningModule):
         loss_sim = torch.tensor(0.0, device=self.device)
         loss_seg = torch.tensor(0.0, device=self.device)
         initial_img = images[0:1].float()
-        target_idx = torch.randint(1, images.shape[0], (1,)).item()
+        target_idx = (
+            images.shape[0] - 1
+            if self.force_last_target
+            else torch.randint(1, images.shape[0], (1,)).item()
+        )
         target_img = images[target_idx:target_idx + 1].float()
         initial_seg = None
         if self.lambda_seg > 0 and bool(has_segs[0]):
@@ -128,7 +141,11 @@ class RegistrationLongitudinal(pl.LightningModule):
             ).permute(0, 4, 1, 2, 3)
         seg_steps = 0
         all_phi, loss_reg, loss_jac = self(
-            initial_img, target_img, ages, ages[target_idx], grid
+            initial_img,
+            target_img,
+            ages,
+            ages[target_idx],
+            grid,
         )
         
         grid_voxel = (grid + 1.) / 2. * scale_factor
@@ -151,10 +168,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         if seg_steps > 0:
             loss_seg = loss_seg / seg_steps
         loss_sim = loss_sim / num_steps
-        target_duration = torch.abs(ages[target_idx] - ages[0]).clamp_min(1e-8)
-        integration_duration = (
-            torch.abs(ages[-1] - ages[0]) / target_duration
-        ).clamp_min(1e-8)
+        integration_duration = torch.abs(ages[-1] - ages[0]).clamp_min(1e-8)
         loss_reg = loss_reg / integration_duration
         loss_jac = loss_jac / integration_duration
         loss = (
@@ -173,12 +187,9 @@ class RegistrationLongitudinal(pl.LightningModule):
                 "Train/Loss/Segmentation": (self.lambda_seg * loss_seg).detach(),
                 "Train/Loss/Regularization": (self.lambda_reg * loss_reg).detach(),
                 "Train/Loss/Jacobian": (self.lambda_jac * loss_jac).detach(),
-                "Train/Context/SequenceLength": float(images.shape[0]),
-                "Train/Context/TargetIndex": float(target_idx),
-                "Optimization/LearningRate": self.trainer.optimizers[0].param_groups[0]["lr"],
             },
             on_step=True,
-            on_epoch=False,
+            on_epoch=True,
             prog_bar=False,
             batch_size=1,
         )
@@ -186,7 +197,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             "Train/Loss/Total",
             loss.detach(),
             on_step=True,
-            on_epoch=False,
+            on_epoch=True,
             prog_bar=True,
             batch_size=1,
         )
@@ -201,7 +212,11 @@ class RegistrationLongitudinal(pl.LightningModule):
         scheduler = self.lr_schedulers()
         scheduler.step()  # type: ignore[union-attr]
         torch.cuda.empty_cache()  # ← add this
-        torch.save(self.model.state_dict(), os.path.join(self.save_dir, "last_registration.pt"))
+        if self.trainer.is_global_zero:
+            torch.save(
+                self.model.state_dict(),
+                os.path.join(self.save_dir, "last_registration.pt"),
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Validation
@@ -216,7 +231,7 @@ class RegistrationLongitudinal(pl.LightningModule):
 
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
-        """Compute validation metrics without saving files or visualisations."""
+        """Compute metrics and visualise the first ten validation sequences."""
         images, _segs, ages, _has_segs = batch
         shape = images[0].shape[2:]
         scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
@@ -226,20 +241,29 @@ class RegistrationLongitudinal(pl.LightningModule):
         shape = images.shape[2:]
         initial_img = images[0:1].float()
         target_img = images[-1:].float()
-        all_phi, _, _ = self(initial_img, target_img, ages, ages[-1], grid)
+        all_phi, _, _ = self(
+            initial_img,
+            target_img,
+            ages,
+            ages[-1],
+            grid,
+        )
         grid_voxel = (grid + 1.) / 2. * scale_factor
 
         for idx in range(1, images.shape[0]):
             df = all_phi[idx] - grid_voxel
             warped = registration.warp(initial_img, df)
             target = images[idx:idx + 1].float()
-            intensity_loss = self.loss_sim(warped, target)
+            if self.lambda_sim > 0:
+                intensity_loss = self.loss_sim(warped, target)
+                self.validation_intensity_losses.append(
+                    float(intensity_loss.cpu())
+                )
             mae = F.l1_loss(warped, target)
             mse = F.mse_loss(warped, target)
             psnr = 10.0 * torch.log10(
                 warped.new_tensor(1.0) / mse.clamp_min(1e-10)
             )
-            self.validation_intensity_losses.append(float(intensity_loss.cpu()))
             self.validation_mae_values.append(float(mae.cpu()))
             self.validation_psnr_values.append(float(psnr.cpu()))
             if idx == images.shape[0] - 1:
@@ -249,25 +273,86 @@ class RegistrationLongitudinal(pl.LightningModule):
                     float(negative_percentage.cpu())
                 )
 
+        if (
+            batch_idx < 10
+            and self.trainer.is_global_zero
+            and self.logger is not None
+            and hasattr(self.logger.experiment, "add_image")
+        ):
+            axial_index = shape[-1] // 2
+            source_slice = utils.normalize_to_0_1(
+                initial_img[0, 0, :, :, axial_index]
+            )
+            target_slice = utils.normalize_to_0_1(
+                images[-1, 0, :, :, axial_index]
+            )
+            warped_slice = utils.normalize_to_0_1(
+                warped[0, 0, :, :, axial_index]
+            )
+            signed_difference = (
+                warped[0, 0, :, :, axial_index]
+                - images[-1, 0, :, :, axial_index]
+            )
+            difference_scale = signed_difference.abs().amax().clamp_min(1e-8)
+            signed_difference = signed_difference / difference_scale
+            positive_difference = signed_difference.clamp_min(0.0)
+            negative_difference = (-signed_difference).clamp_min(0.0)
+            difference_rgb = torch.stack(
+                [
+                    1.0 - negative_difference,
+                    1.0 - signed_difference.abs(),
+                    1.0 - positive_difference,
+                ],
+                dim=0,
+            )
+            axial_comparison = torch.cat(
+                [
+                    source_slice.unsqueeze(0).expand(3, -1, -1),
+                    target_slice.unsqueeze(0).expand(3, -1, -1),
+                    warped_slice.unsqueeze(0).expand(3, -1, -1),
+                    difference_rgb,
+                ],
+                dim=2,
+            )
+            self.logger.experiment.add_image(
+                f"Validation/Axial/Sequence_{batch_idx:02d}_Source_Target_Warped_Difference",
+                axial_comparison.detach().cpu(),
+                global_step=self.global_step,
+            )
+
     def on_validation_epoch_end(self) -> None:
         """Log aggregated metrics and grid images; save model if a new Dice best is reached."""
         if self.validation_intensity_losses:
             mean_intensity_loss = float(np.mean(self.validation_intensity_losses))
-            mean_mae = float(np.mean(self.validation_mae_values))
-            mean_psnr = float(np.mean(self.validation_psnr_values))
             self.log(
                 "Validation/Intensity/LNCC",
                 mean_intensity_loss,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
+                sync_dist=True,
             )
+
+            if (
+                self.trainer.is_global_zero
+                and mean_intensity_loss < self.min_intensity_loss
+            ):
+                self.min_intensity_loss = mean_intensity_loss
+                torch.save(
+                    self.model.state_dict(),
+                    os.path.join(self.save_dir, "best_registration.pt"),
+                )
+
+        if self.validation_mae_values:
+            mean_mae = float(np.mean(self.validation_mae_values))
+            mean_psnr = float(np.mean(self.validation_psnr_values))
             self.log(
                 "Validation/Intensity/MAE",
                 mean_mae,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
+                sync_dist=True,
             )
             self.log(
                 "Validation/Intensity/PSNR",
@@ -275,6 +360,7 @@ class RegistrationLongitudinal(pl.LightningModule):
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
+                sync_dist=True,
             )
             if self.validation_negative_jacobian_percentages:
                 mean_negative_jacobian = float(
@@ -286,12 +372,7 @@ class RegistrationLongitudinal(pl.LightningModule):
                     on_step=False,
                     on_epoch=True,
                     prog_bar=True,
-                )
-            if mean_intensity_loss < self.min_intensity_loss:
-                self.min_intensity_loss = mean_intensity_loss
-                torch.save(
-                    self.model.state_dict(),
-                    os.path.join(self.save_dir, "best_registration.pt"),
+                    sync_dist=True,
                 )
 
         # Reset
@@ -323,7 +404,11 @@ class RegistrationLongitudinal(pl.LightningModule):
         initial_img = images[0:1].float()
 
         all_phi, _, _ = self(
-            initial_img, images[-1:].float(), ages, ages[-1], grid
+            initial_img,
+            images[-1:].float(),
+            ages,
+            ages[-1],
+            grid,
         )
         grid_voxel = (grid + 1.0) / 2.0 * scale_factor
         slice_index = shape[-1] // 2

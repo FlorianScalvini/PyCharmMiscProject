@@ -1,5 +1,5 @@
 name: 'macaque'
-root_dir: /home/florian/Documents/Dataset/AtlasImages/AtlasImages_affine/
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/Macaque_Atlas/
 train_json: data.json
 val_json: data.json
 label_metadata: labels_metadata.json
@@ -10,4 +10,4 @@ num_classes: 20
 date_format: null
 csize: [ 128, 160, 128 ]
 rsize: [ 128, 160, 128 ]
-
+force_last_target: true

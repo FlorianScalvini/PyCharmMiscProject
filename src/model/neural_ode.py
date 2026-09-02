@@ -71,7 +71,11 @@ class LongitudinalODERegistration(nn.Module):
         passes per training step.
     """
 
-    def __init__(self, shape: list[int] = [192, 224, 192], step_time: float = 0.05) -> None:
+    def __init__(
+        self,
+        shape: list[int] = [192, 224, 192],
+        step_time: float = 0.05,
+    ) -> None:
         super().__init__()
         self.velocity_net = VelocityNet(shape=shape)
         self.jacobian_loss = losses.NonDetJacobianPenalty()
@@ -114,10 +118,10 @@ class LongitudinalODERegistration(nn.Module):
             time step (scalar).
         """
         duration = ages_target - ages[0]
-        if torch.any(duration <= 0):
-            raise ValueError("ages_target must be strictly greater than ages[0]")
+        if torch.any(duration == 0):
+            raise ValueError("ages_target must be different from ages[0]")
         relative_ages = (ages - ages[0]) / duration
-
+        source_age_normalized = ages[0]
         ode_func = ODEFunction(
             self.velocity_net,
             imageA,
@@ -125,9 +129,11 @@ class LongitudinalODERegistration(nn.Module):
             identity_grid=grid,
             loss_jac=self.jacobian_loss,
             loss_v=loss_v,
+            source_age_normalized=source_age_normalized,
+            duration_normalized=duration,
         )
         zero = imageA.new_zeros(())
-        phi_traj, loss_reg_traj, loss_jac_traj = odeint(
+        phi_traj, loss_reg_traj, loss_jac_traj = odeint( # type: ignore
             ode_func,
             (
                 grid,
@@ -173,6 +179,8 @@ class ODEFunction(nn.Module):
         imageB: torch.Tensor,
         identity_grid: torch.Tensor,
         loss_jac: nn.Module,
+        source_age_normalized: torch.Tensor,
+        duration_normalized: torch.Tensor,
         loss_v: nn.Module = monai.losses.DiffusionLoss(normalize=True), # type: ignore
     ) -> None:
         super().__init__()
@@ -182,6 +190,8 @@ class ODEFunction(nn.Module):
         self.identity_grid = identity_grid
         self.loss_v = loss_v
         self.loss_jac = loss_jac
+        self.source_age_normalized = source_age_normalized
+        self.duration_normalized = duration_normalized
 
     def forward(
         self,
@@ -209,13 +219,27 @@ class ODEFunction(nn.Module):
             accumulated into the state for later retrieval.
         """
         phi_t = state[0]
-        v = self.vnet(t, phi_t, self.imageA, self.imageB)
+        current_age_normalized = (
+            self.source_age_normalized + t * self.duration_normalized
+        )
+        v = self.vnet(
+            t,
+            current_age_normalized,
+            self.duration_normalized,
+            phi_t,
+            self.imageA,
+            self.imageB,
+        )
         loss_v: torch.Tensor = self.loss_v(v)
         shape = phi_t.shape[2:]
         scale = phi_t.new_tensor(shape).view(1, 3, 1, 1, 1)
         displacement_voxel = (phi_t - self.identity_grid) * scale / 2.0
         loss_jac: torch.Tensor = self.loss_jac(displacement_voxel)
-        return v, loss_v, loss_jac
+        # The ODE is parameterized by relative time tau in [0, 1].
+        # |d age / d tau| keeps accumulated losses positive in both temporal
+        # directions and converts their integral back to the absolute-age scale.
+        absolute_duration = torch.abs(self.duration_normalized)
+        return v, loss_v * absolute_duration, loss_jac * absolute_duration
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -277,7 +301,7 @@ class VelocityNet(nn.Module):
             self.t_dim_enc, max_periods=100
         )
         self.time_mlp = nn.Sequential(
-            nn.Linear(self.t_dim_enc, self.t_dim, bias=True),
+            nn.Linear(3 * self.t_dim_enc, self.t_dim, bias=True),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -294,6 +318,8 @@ class VelocityNet(nn.Module):
     def forward(
         self,
         t: torch.Tensor,
+        absolute_age: torch.Tensor,
+        duration: torch.Tensor,
         phi_t: torch.Tensor,
         image_A: torch.Tensor,
         image_B: torch.Tensor,
@@ -326,7 +352,19 @@ class VelocityNet(nn.Module):
 
         if t.dim() == 0:
             t = t.expand(B)
-        t_all: torch.Tensor = self.time_mlp(self.temp_enc(t))
+        if absolute_age.dim() == 0:
+            absolute_age = absolute_age.expand(B)
+        if duration.dim() == 0:
+            duration = duration.expand(B)
+        temporal_context = torch.cat(
+            [
+                self.temp_enc(t),
+                self.temp_enc(absolute_age),
+                self.temp_enc(duration),
+            ],
+            dim=-1,
+        )
+        t_all: torch.Tensor = self.time_mlp(temporal_context)
 
         feat_maps = self.encoder(net_input, t_all)
         v = self.decoder_0(feat_maps[4], feat_maps[3], t_all)

@@ -179,6 +179,23 @@ def parse_args() -> Namespace:
         default=100,
         help="Save a checkpoint every N training steps.",
     )
+    parser.add_argument(
+        "--force_last_target",
+        action="store_true",
+        help="Always use the last session as the training target.",
+    )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=1,
+        help="Number of GPUs used per node.",
+    )
+    parser.add_argument(
+        "--num_nodes",
+        type=int,
+        default=1,
+        help="Number of SLURM nodes used for distributed training.",
+    )
 
     return parser.parse_args()
 
@@ -213,17 +230,19 @@ def main(args: Namespace) -> None:
     tensorboard_logger: TensorBoardLogger = TensorBoardLogger(
         save_dir=save_dir,
         name="tensorboard",
-        version="metrics",
+        version=0,
         default_hp_metric=False,
     )
 
     # --- Data module ---
-    datamodule: pl.LightningDataModule = SpatioTemporalSequenceDatamoduleJSON(
+    datamodule: SpatioTemporalSequenceDatamoduleJSON = SpatioTemporalSequenceDatamoduleJSON(
         root_dir=config["root_dir"],
         json_path=config["train_json"],
         json_path_val=config["val_json"],
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        t0=config["t0"],
+        tn=config["tn"],
     )
 
     # --- Model ---
@@ -236,12 +255,19 @@ def main(args: Namespace) -> None:
         lambda_jac=args.lambda_jac,
         shape=config["rsize"],
         step_time=0.1,
+        force_last_target=(
+            args.force_last_target or config.get("force_last_target", False)
+        ),
     )
 
     # --- Trainer ---
     trainer: pl.Trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         precision=args.precision,
+        accelerator="gpu",
+        devices=args.devices,
+        num_nodes=args.num_nodes,
+        strategy="ddp" if args.devices * args.num_nodes > 1 else "auto",
         num_sanity_val_steps=args.num_sanity_val_steps,
         logger=tensorboard_logger,
         callbacks=[

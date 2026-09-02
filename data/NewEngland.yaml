@@ -1,0 +1,12 @@
+name: 'NewEngland'
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/NewEngland/
+train_json: data_train.json
+val_json: data_val.json
+gi_normalized: null
+t0: 0
+tn: 130
+date_format: null
+csize: [ 192, 192, 192 ]
+rsize: [ 192, 192, 192 ]
+force_last_target: true
+

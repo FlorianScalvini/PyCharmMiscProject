@@ -1,5 +1,7 @@
 name: 'gholipour'
-csv_path: /home/florian/Documents/Programs/longitudinal-svf/dataset/Gholipour/dataset.csv
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/Gholipour
+train_json: data.json
+val_json: data.json
 label_metadata: /home/florian/Documents/Programs/longitudinal-svf/dataset/Gholipour/labels_metadata.json
 t0: 21
 tn: 38
@@ -8,3 +10,4 @@ rsize: [ 160, 192, 160  ]
 num_classes: 23
 date_format: null
 gi_normalized: ""
+force_last_target: true

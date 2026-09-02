@@ -1,5 +1,5 @@
 name: 'dhcpsubject'
-root_dir: /home/florian/Documents/Dataset/dHCP/Subject/
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/dHCP/Subject/
 train_json: fmri_data_train.json
 val_json: fmri_data_val.json
 label_metadata: labels_metadata.json

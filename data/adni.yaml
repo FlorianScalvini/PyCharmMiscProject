@@ -1,5 +1,5 @@
 name: 'ADNI'
-root_dir: /media/florian/SamsungDisk/Postdoc/Datasets/ADNI
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/ADNI
 train_json: data_train.json
 val_json: data_val.json
 gi_normalized: null
