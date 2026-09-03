@@ -249,6 +249,24 @@ class RegistrationLongitudinal(pl.LightningModule):
             grid,
         )
         grid_voxel = (grid + 1.) / 2. * scale_factor
+        visualize_sequence = (
+            batch_idx < 10
+            and self.trainer.is_global_zero
+            and self.logger is not None
+            and hasattr(self.logger.experiment, "add_image")
+        )
+        axial_index = shape[-1] // 2
+        target_slices = []
+        warped_slices = []
+        difference_slices = []
+        if visualize_sequence:
+            source_slice = utils.normalize_to_0_1(
+                initial_img[0, 0, :, :, axial_index]
+            )
+            source_rgb = source_slice.unsqueeze(0).expand(3, -1, -1)
+            target_slices.append(source_rgb)
+            warped_slices.append(source_rgb)
+            difference_slices.append(torch.ones_like(source_rgb))
 
         for idx in range(1, images.shape[0]):
             df = all_phi[idx] - grid_voxel
@@ -273,52 +291,54 @@ class RegistrationLongitudinal(pl.LightningModule):
                     float(negative_percentage.cpu())
                 )
 
-        if (
-            batch_idx < 10
-            and self.trainer.is_global_zero
-            and self.logger is not None
-            and hasattr(self.logger.experiment, "add_image")
-        ):
-            axial_index = shape[-1] // 2
-            source_slice = utils.normalize_to_0_1(
-                initial_img[0, 0, :, :, axial_index]
-            )
-            target_slice = utils.normalize_to_0_1(
-                images[-1, 0, :, :, axial_index]
-            )
-            warped_slice = utils.normalize_to_0_1(
-                warped[0, 0, :, :, axial_index]
-            )
-            signed_difference = (
-                warped[0, 0, :, :, axial_index]
-                - images[-1, 0, :, :, axial_index]
-            )
-            difference_scale = signed_difference.abs().amax().clamp_min(1e-8)
-            signed_difference = signed_difference / difference_scale
-            positive_difference = signed_difference.clamp_min(0.0)
-            negative_difference = (-signed_difference).clamp_min(0.0)
-            difference_rgb = torch.stack(
-                [
-                    1.0 - negative_difference,
-                    1.0 - signed_difference.abs(),
-                    1.0 - positive_difference,
-                ],
-                dim=0,
-            )
+            if visualize_sequence:
+                target_slice = utils.normalize_to_0_1(
+                    target[0, 0, :, :, axial_index]
+                )
+                warped_slice = utils.normalize_to_0_1(
+                    warped[0, 0, :, :, axial_index]
+                )
+                signed_difference = (
+                    warped[0, 0, :, :, axial_index]
+                    - target[0, 0, :, :, axial_index]
+                )
+                difference_scale = signed_difference.abs().amax().clamp_min(1e-8)
+                signed_difference = signed_difference / difference_scale
+                positive_difference = signed_difference.clamp_min(0.0)
+                negative_difference = (-signed_difference).clamp_min(0.0)
+                difference_rgb = torch.stack(
+                    [
+                        1.0 - negative_difference,
+                        1.0 - signed_difference.abs(),
+                        1.0 - positive_difference,
+                    ],
+                    dim=0,
+                )
+                target_slices.append(target_slice.unsqueeze(0).expand(3, -1, -1))
+                warped_slices.append(warped_slice.unsqueeze(0).expand(3, -1, -1))
+                difference_slices.append(difference_rgb)
+
+        if visualize_sequence:
             axial_comparison = torch.cat(
                 [
-                    source_slice.unsqueeze(0).expand(3, -1, -1),
-                    target_slice.unsqueeze(0).expand(3, -1, -1),
-                    warped_slice.unsqueeze(0).expand(3, -1, -1),
-                    difference_rgb,
+                    torch.cat(target_slices, dim=2),
+                    torch.cat(warped_slices, dim=2),
+                    torch.cat(difference_slices, dim=2),
                 ],
-                dim=2,
+                dim=1,
             )
             self.logger.experiment.add_image(
-                f"Validation/Axial/Sequence_{batch_idx:02d}_Source_Target_Warped_Difference",
+                f"Validation/Axial/Sequence_{batch_idx:02d}_Targets_Warped_Differences",
                 axial_comparison.detach().cpu(),
                 global_step=self.global_step,
             )
+            if hasattr(self.logger.experiment, "add_text"):
+                age_values = ", ".join(f"{age:.4f}" for age in ages.tolist())
+                self.logger.experiment.add_text(
+                    f"Validation/Axial/Sequence_{batch_idx:02d}_Normalized_Ages",
+                    age_values,
+                    global_step=self.global_step,
+                )
 
     def on_validation_epoch_end(self) -> None:
         """Log aggregated metrics and grid images; save model if a new Dice best is reached."""

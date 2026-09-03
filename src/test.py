@@ -46,7 +46,7 @@ def main(args: Namespace) -> None:
         config: Dict[str, Any] = yaml.safe_load(f)
 
     # --- Output directory ---
-    dir_name: str = datetime.now().strftime("%y_%d_%H_%M")
+    dir_name: str = datetime.now().strftime("%y_%m_%d_%H_%M_%S")
     save_dir: str = os.path.join("./", "results", config["name"], "test", dir_name)
     if os.path.exists(save_dir):
         # create versioned directory if the base directory already exists
