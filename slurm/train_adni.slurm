@@ -22,8 +22,9 @@ module load pytorch-gpu
 PROJECT_DIR=/lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/
 cd "$PROJECT_DIR"
 
-lambda_reg_values=(5)
-lambda_jac_values=(100)
+lambda_reg_values=(10)
+lambda_jac_values=(1000)
+
 
 lambda_reg=${lambda_reg_values[$SLURM_ARRAY_TASK_ID]}
 lambda_jac=${lambda_jac_values[$SLURM_ARRAY_TASK_ID]}
