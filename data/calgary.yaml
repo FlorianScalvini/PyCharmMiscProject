@@ -1,12 +1,10 @@
 name: 'Calgary'
-root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/Calgary/
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/Datasets/Calgary/
 train_json: data_train.json
 val_json: data_val.json
 gi_normalized: null
 date_format: null
 t0: 1
 tn: 13
-csize: [ 192, 224, 224 ]
-rsize: [ 192, 224, 224 ]
-
-
+csize: [ 256, 256, 112 ]
+rsize: [ 256, 256, 112 ]

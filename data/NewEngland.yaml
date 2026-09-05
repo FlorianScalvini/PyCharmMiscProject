@@ -1,5 +1,5 @@
 name: 'NewEngland'
-root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject/Datasets/NewEngland/
+root_dir: /lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/Datasets/NewEngland/
 train_json: data_train.json
 val_json: data_val.json
 gi_normalized: null

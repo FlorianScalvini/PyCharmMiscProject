@@ -91,7 +91,9 @@ class RegistrationLongitudinal(pl.LightningModule):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the ODE registration and rescale deformation fields to voxel space."""
         shape = source.shape[2:]
-        scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
+        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
+            1, 3, 1, 1, 1
+        )
         all_phi, loss_reg, loss_jac = self.model(
             source,
             target,
@@ -118,7 +120,9 @@ class RegistrationLongitudinal(pl.LightningModule):
 
         images, segs, ages, has_segs = batch
         shape = images[0].shape[2:]
-        scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
+        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
+            1, 3, 1, 1, 1
+        )
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
 
         images = images.squeeze(0)
@@ -127,48 +131,65 @@ class RegistrationLongitudinal(pl.LightningModule):
 
         loss_sim = torch.tensor(0.0, device=self.device)
         loss_seg = torch.tensor(0.0, device=self.device)
-        initial_img = images[0:1].float()
+        initial_img_idx = (
+            0
+            if self.force_last_target
+            else torch.randint(0, images.shape[0] - 1, (1,)).item()
+        )
+        initial_img = images[initial_img_idx:initial_img_idx + 1].float()
         target_idx = (
             images.shape[0] - 1
             if self.force_last_target
-            else torch.randint(1, images.shape[0], (1,)).item()
+            else torch.randint(int(initial_img_idx) + 1, images.shape[0], (1,)).item()
         )
         target_img = images[target_idx:target_idx + 1].float()
+        # The identity deformation corresponds to the selected source image.
+        # Therefore the ODE time sequence must also start at that source age;
+        # passing the complete sequence would incorrectly anchor a later source
+        # image at ``ages[0]``.
+        sequence_images = images[initial_img_idx:]
+        sequence_ages = ages[initial_img_idx:]
+        target_sequence_idx = target_idx - initial_img_idx
         initial_seg = None
-        if self.lambda_seg > 0 and bool(has_segs[0]):
+        if self.lambda_seg > 0 and bool(has_segs[initial_img_idx]):
             initial_seg = F.one_hot(
-                segs[:, 0].squeeze(0).cpu().long(), num_classes=-1
+                segs[:, initial_img_idx].squeeze(0).cpu().long(), num_classes=-1
             ).permute(0, 4, 1, 2, 3)
         seg_steps = 0
         all_phi, loss_reg, loss_jac = self(
             initial_img,
             target_img,
-            ages,
-            ages[target_idx],
+            sequence_ages,
+            sequence_ages[target_sequence_idx],
             grid,
         )
         
         grid_voxel = (grid + 1.) / 2. * scale_factor
 
-        for idx in range(1, images.shape[0]):
-            phi = all_phi[idx]
+        for sequence_idx in range(1, sequence_images.shape[0]):
+            absolute_idx = initial_img_idx + sequence_idx
+            phi = all_phi[sequence_idx]
             df = phi - grid_voxel
             if self.lambda_sim > 0:
                 warped = registration.warp(initial_img, df)
-                loss_sim += self.loss_sim(warped, images[idx:idx + 1].float())
+                loss_sim += self.loss_sim(
+                    warped, sequence_images[sequence_idx:sequence_idx + 1].float()
+                )
                 del warped
-            if initial_seg is not None and bool(has_segs[idx]):
+            if initial_seg is not None and bool(has_segs[absolute_idx]):
                 warped_seg = registration.warp(initial_seg.float().to(self.device), df)
-                loss_seg += self.loss_seg(warped_seg, F.one_hot(segs[:, idx].squeeze(0).cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3).float().to(self.device))
+                loss_seg += self.loss_seg(warped_seg, F.one_hot(segs[:, absolute_idx].squeeze(0).cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3).float().to(self.device))
                 seg_steps += 1
                 del warped_seg
             del phi, df
 
-        num_steps = images.shape[0] - 1
+        num_steps = sequence_images.shape[0] - 1
         if seg_steps > 0:
             loss_seg = loss_seg / seg_steps
         loss_sim = loss_sim / num_steps
-        integration_duration = torch.abs(ages[-1] - ages[0]).clamp_min(1e-8)
+        integration_duration = torch.abs(
+            sequence_ages[-1] - sequence_ages[0]
+        ).clamp_min(1e-8)
         loss_reg = loss_reg / integration_duration
         loss_jac = loss_jac / integration_duration
         loss = (
@@ -188,18 +209,20 @@ class RegistrationLongitudinal(pl.LightningModule):
                 "Train/Loss/Regularization": (self.lambda_reg * loss_reg).detach(),
                 "Train/Loss/Jacobian": (self.lambda_jac * loss_jac).detach(),
             },
-            on_step=True,
+            on_step=False,
             on_epoch=True,
             prog_bar=False,
             batch_size=1,
+            sync_dist=True,
         )
         self.log(
             "Train/Loss/Total",
             loss.detach(),
-            on_step=True,
+            on_step=False,
             on_epoch=True,
             prog_bar=True,
             batch_size=1,
+            sync_dist=True,
         )
 
         # ── critical: free the ODE trajectory ──
@@ -234,7 +257,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         """Compute metrics and visualise the first ten validation sequences."""
         images, _segs, ages, _has_segs = batch
         shape = images[0].shape[2:]
-        scale_factor = torch.tensor(shape).to(self.device).view(1, 3, 1, 1, 1) * 1.
+        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
+            1, 3, 1, 1, 1
+        )
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
         images = images.squeeze(0)
         ages = ages.squeeze(0).to(self.device)
@@ -415,7 +440,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         """Save central target/registered slices as PNG files."""
         images, _segs, ages, _has_segs = batch
         shape = images[0].shape[2:]
-        scale_factor = torch.tensor(shape, device=self.device).view(
+        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
             1, 3, 1, 1, 1
         )
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)

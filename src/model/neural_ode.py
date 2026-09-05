@@ -279,7 +279,11 @@ class VelocityNet(nn.Module):
     ) -> None:
         super().__init__()
         self.shape = shape
-        self.grid = registration.generate_grid3d_tensor(self.shape).cuda()
+        self.register_buffer(
+            "grid",
+            registration.generate_grid3d_tensor(self.shape),
+            persistent=False,
+        )
         self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
         self.encoder = EncoderUnet(
