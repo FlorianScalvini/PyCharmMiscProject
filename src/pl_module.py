@@ -65,7 +65,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.lambda_seg = lambda_seg
         self.lambda_jac = lambda_jac
         # Loss functions and metrics
-        self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=9) # type: ignore
+        self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=7) # type: ignore
         self.loss_reg = losses.Grad3d('l2')
         self.loss_seg = nn.MSELoss()
 
@@ -113,7 +113,7 @@ class RegistrationLongitudinal(pl.LightningModule):
     def configure_optimizers(self) -> tuple[list, list]:
         """Return Adam optimiser with exponential LR decay."""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+        lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
         return [optimizer], [lr_scheduler]
 
     def training_step(self, batch: tuple, batch_idx: int) -> None:
@@ -181,6 +181,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         )
         optimizer.zero_grad() # type: ignore
         self.manual_backward(loss)
+        self._log_gradient_diagnostics()
         optimizer.step() # type: ignore
 
         self.log_dict(
@@ -210,6 +211,67 @@ class RegistrationLongitudinal(pl.LightningModule):
         del all_phi, grid_voxel, loss, loss_sim, loss_reg
         # ── always flush at end of step ──
         torch.cuda.empty_cache()
+
+    def _log_gradient_diagnostics(self) -> None:
+        """Log gradient magnitudes and periodically record the output head."""
+        gradients = [
+            parameter.grad.detach()
+            for parameter in self.model.parameters()
+            if parameter.grad is not None
+        ]
+        if not gradients:
+            return
+
+        global_norm = torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(gradient) for gradient in gradients])
+        )
+        global_max = torch.stack(
+            [gradient.abs().amax() for gradient in gradients]
+        ).amax()
+        self.log(
+            "Optimization/GradientNorm", global_norm,
+            on_step=True, on_epoch=True, prog_bar=False,
+            batch_size=1, sync_dist=True,
+        )
+        self.log(
+            "Optimization/GradientMaxAbs", global_max,
+            on_step=True, on_epoch=True, prog_bar=False,
+            batch_size=1, sync_dist=True,
+        )
+
+        velocity_net = getattr(self.model, "velocity_net", None)
+        output_layer = velocity_net.reg_head[-1] if velocity_net is not None else None
+        output_gradient = (
+            output_layer.weight.grad
+            if isinstance(output_layer, nn.Conv3d)
+            else None
+        )
+        if output_gradient is None:
+            return
+
+        output_gradient = output_gradient.detach()
+        self.log(
+            "Optimization/OutputHeadGradientNorm",
+            torch.linalg.vector_norm(output_gradient),
+            on_step=True, on_epoch=True, prog_bar=False,
+            batch_size=1, sync_dist=True,
+        )
+
+        trainer = getattr(self, "_trainer", None)
+        logger = trainer.logger if trainer is not None else None
+        experiment = logger.experiment if logger is not None else None
+        if (
+            trainer is not None
+            and trainer.is_global_zero
+            and self.global_step % 100 == 0
+            and experiment is not None
+            and hasattr(experiment, "add_histogram")
+        ):
+            experiment.add_histogram(
+                "Optimization/OutputHeadGradientHistogram",
+                output_gradient.cpu(),
+                global_step=self.global_step,
+            )
 
     def on_train_epoch_end(self) -> None:
         """Flush GPU cache and save a checkpoint at the end of each training epoch."""
