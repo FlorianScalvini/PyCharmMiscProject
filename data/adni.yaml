@@ -5,6 +5,8 @@ val_json: data_val.json
 gi_normalized: null
 t0: 50
 tn: 100
+temporal_conditioning: relative_duration
+duration_scale: 4.0
 date_format: null
 csize: [ 192, 224, 224 ]
 rsize: [ 192, 224, 224 ]

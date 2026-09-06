@@ -436,12 +436,12 @@ class Conv3dReLU(nn.Sequential):
         self.nm = nn.InstanceNorm3d(out_channels)
         self.relu = nn.LeakyReLU(inplace=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Apply convolution, normalisation, and activation.
 
         Parameters
         ----------
-        x : torch.Tensor
+        input : torch.Tensor
             Input feature map ``(B, in_channels, D, H, W)``.
 
         Returns
@@ -449,7 +449,7 @@ class Conv3dReLU(nn.Sequential):
         out : torch.Tensor
             Activated output ``(B, out_channels, D', H', W')``.
         """
-        out = self.conv(x)
+        out = self.conv(input)
         out = self.nm(out)
         out = self.relu(out)
         return out

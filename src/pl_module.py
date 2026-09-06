@@ -2,8 +2,8 @@
 import os
 
 # --- Third-party ---
-import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import monai
@@ -39,7 +39,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         lambda_jac: float = 0.000001,
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.1,
-        force_last_target: bool = False,
+        temporal_conditioning: str = "endpoint_ages",
+        age_span: float = 1.0,
+        duration_scale: float = 4.0,
         *args,
         **kwargs,
     ) -> None:
@@ -52,6 +54,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.model = LongitudinalODERegistration(
             shape=shape,
             step_time=step_time,
+            temporal_conditioning=temporal_conditioning,
+            age_span=age_span,
+            duration_scale=duration_scale,
         )
 
         # Hyperparameters
@@ -59,7 +64,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.lambda_sim = lambda_sim
         self.lambda_seg = lambda_seg
         self.lambda_jac = lambda_jac
-        self.force_last_target = force_last_target
         # Loss functions and metrics
         self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=9) # type: ignore
         self.loss_reg = losses.Grad3d('l2')
@@ -86,7 +90,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         source: torch.Tensor,
         target: torch.Tensor,
         ages: torch.Tensor,
-        target_age: torch.Tensor,
         grid: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the ODE registration and rescale deformation fields to voxel space."""
@@ -98,7 +101,6 @@ class RegistrationLongitudinal(pl.LightningModule):
             source,
             target,
             ages,
-            target_age,
             grid,
         )
         all_phi = (all_phi + 1.) / 2. * scale_factor
@@ -131,65 +133,44 @@ class RegistrationLongitudinal(pl.LightningModule):
 
         loss_sim = torch.tensor(0.0, device=self.device)
         loss_seg = torch.tensor(0.0, device=self.device)
-        initial_img_idx = (
-            0
-            if self.force_last_target
-            else torch.randint(0, images.shape[0] - 1, (1,)).item()
-        )
-        initial_img = images[initial_img_idx:initial_img_idx + 1].float()
-        target_idx = (
-            images.shape[0] - 1
-            if self.force_last_target
-            else torch.randint(int(initial_img_idx) + 1, images.shape[0], (1,)).item()
-        )
-        target_img = images[target_idx:target_idx + 1].float()
-        # The identity deformation corresponds to the selected source image.
-        # Therefore the ODE time sequence must also start at that source age;
-        # passing the complete sequence would incorrectly anchor a later source
-        # image at ``ages[0]``.
-        sequence_images = images[initial_img_idx:]
-        sequence_ages = ages[initial_img_idx:]
-        target_sequence_idx = target_idx - initial_img_idx
+        initial_img = images[0:1].float()
+        target_img = images[-1:].float()
         initial_seg = None
-        if self.lambda_seg > 0 and bool(has_segs[initial_img_idx]):
+        if self.lambda_seg > 0 and bool(has_segs[0]):
             initial_seg = F.one_hot(
-                segs[:, initial_img_idx].squeeze(0).cpu().long(), num_classes=-1
+                segs[:, 0].squeeze(0).cpu().long(), num_classes=-1
             ).permute(0, 4, 1, 2, 3)
         seg_steps = 0
         all_phi, loss_reg, loss_jac = self(
             initial_img,
             target_img,
-            sequence_ages,
-            sequence_ages[target_sequence_idx],
+            ages,
             grid,
         )
         
         grid_voxel = (grid + 1.) / 2. * scale_factor
 
-        for sequence_idx in range(1, sequence_images.shape[0]):
-            absolute_idx = initial_img_idx + sequence_idx
-            phi = all_phi[sequence_idx]
+        for idx in range(1, images.shape[0]):
+            phi = all_phi[idx]
             df = phi - grid_voxel
             if self.lambda_sim > 0:
                 warped = registration.warp(initial_img, df)
                 loss_sim += self.loss_sim(
-                    warped, sequence_images[sequence_idx:sequence_idx + 1].float()
+                    warped, images[idx:idx + 1].float()
                 )
                 del warped
-            if initial_seg is not None and bool(has_segs[absolute_idx]):
+            if initial_seg is not None and bool(has_segs[idx]):
                 warped_seg = registration.warp(initial_seg.float().to(self.device), df)
-                loss_seg += self.loss_seg(warped_seg, F.one_hot(segs[:, absolute_idx].squeeze(0).cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3).float().to(self.device))
+                loss_seg += self.loss_seg(warped_seg, F.one_hot(segs[:, idx].squeeze(0).cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3).float().to(self.device))
                 seg_steps += 1
                 del warped_seg
             del phi, df
 
-        num_steps = sequence_images.shape[0] - 1
+        num_steps = images.shape[0] - 1
         if seg_steps > 0:
             loss_seg = loss_seg / seg_steps
         loss_sim = loss_sim / num_steps
-        integration_duration = torch.abs(
-            sequence_ages[-1] - sequence_ages[0]
-        ).clamp_min(1e-8)
+        integration_duration = torch.abs(ages[-1] - ages[0]).clamp_min(1e-8)
         loss_reg = loss_reg / integration_duration
         loss_jac = loss_jac / integration_duration
         loss = (
@@ -270,7 +251,6 @@ class RegistrationLongitudinal(pl.LightningModule):
             initial_img,
             target_img,
             ages,
-            ages[-1],
             grid,
         )
         grid_voxel = (grid + 1.) / 2. * scale_factor
@@ -366,61 +346,74 @@ class RegistrationLongitudinal(pl.LightningModule):
                 )
 
     def on_validation_epoch_end(self) -> None:
-        """Log aggregated metrics and grid images; save model if a new Dice best is reached."""
-        if self.validation_intensity_losses:
-            mean_intensity_loss = float(np.mean(self.validation_intensity_losses))
+        """Log global validation means and select the checkpoint using global LNCC."""
+        # Sequences have different numbers of comparisons. Reduce sums and
+        # counts, not per-rank means, and include ranks with no observations.
+        metric_values = (
+            self.validation_intensity_losses,
+            self.validation_mae_values,
+            self.validation_psnr_values,
+            self.validation_negative_jacobian_percentages,
+        )
+        statistics = torch.tensor(
+            [[sum(values), len(values)] for values in metric_values],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+        global_means = [
+            total / count if count > 0 else None
+            for total, count in statistics.cpu().tolist()
+        ]
+        mean_intensity_loss, mean_mae, mean_psnr, mean_negative_jacobian = global_means
+
+        if mean_intensity_loss is not None:
             self.log(
                 "Validation/Intensity/LNCC",
                 mean_intensity_loss,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
-                sync_dist=True,
+                sync_dist=False,  # Already reduced across all ranks.
             )
 
-            if (
-                self.trainer.is_global_zero
-                and mean_intensity_loss < self.min_intensity_loss
-            ):
+            if mean_intensity_loss < self.min_intensity_loss:
                 self.min_intensity_loss = mean_intensity_loss
-                torch.save(
-                    self.model.state_dict(),
-                    os.path.join(self.save_dir, "best_registration.pt"),
-                )
+                if self.trainer.is_global_zero:
+                    torch.save(
+                        self.model.state_dict(),
+                        os.path.join(self.save_dir, "best_registration.pt"),
+                    )
 
-        if self.validation_mae_values:
-            mean_mae = float(np.mean(self.validation_mae_values))
-            mean_psnr = float(np.mean(self.validation_psnr_values))
+        if mean_mae is not None:
             self.log(
                 "Validation/Intensity/MAE",
                 mean_mae,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=False,
-                sync_dist=True,
+                sync_dist=False,
             )
+        if mean_psnr is not None:
             self.log(
                 "Validation/Intensity/PSNR",
                 mean_psnr,
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
-                sync_dist=True,
+                sync_dist=False,
             )
-            if self.validation_negative_jacobian_percentages:
-                mean_negative_jacobian = float(
-                    np.mean(self.validation_negative_jacobian_percentages)
-                )
-                self.log(
-                    "Validation/Deformation/NegativeJacobianPercent",
-                    mean_negative_jacobian,
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True,
-                    sync_dist=True,
-                )
+        if mean_negative_jacobian is not None:
+            self.log(
+                "Validation/Deformation/NegativeJacobianPercent",
+                mean_negative_jacobian,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                sync_dist=False,
+            )
 
-        # Reset
         self.validation_intensity_losses = []
         self.validation_mae_values = []
         self.validation_psnr_values = []
@@ -452,7 +445,6 @@ class RegistrationLongitudinal(pl.LightningModule):
             initial_img,
             images[-1:].float(),
             ages,
-            ages[-1],
             grid,
         )
         grid_voxel = (grid + 1.0) / 2.0 * scale_factor

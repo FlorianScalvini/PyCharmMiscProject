@@ -180,11 +180,6 @@ def parse_args() -> Namespace:
         help="Save a checkpoint every N training steps.",
     )
     parser.add_argument(
-        "--force_last_target",
-        action="store_true",
-        help="Always use the last session as the training target.",
-    )
-    parser.add_argument(
         "--devices",
         type=int,
         default=1,
@@ -255,9 +250,9 @@ def main(args: Namespace) -> None:
         lambda_jac=args.lambda_jac,
         shape=config["rsize"],
         step_time=0.1,
-        force_last_target=(
-            args.force_last_target or config.get("force_last_target", False)
-        ),
+        temporal_conditioning=config.get("temporal_conditioning", "endpoint_ages"),
+        age_span=float(config["tn"]) - float(config["t0"]),
+        duration_scale=float(config.get("duration_scale", 4.0)),
     )
 
     # --- Trainer ---

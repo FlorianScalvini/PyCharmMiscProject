@@ -10,4 +10,3 @@ csize: [ 128, 192, 96 ]
 rsize: [ 128, 192, 96 ]
 date_format: null
 num_classes: 15
-force_last_target: true

@@ -10,4 +10,3 @@ rsize: [ 160, 192, 160  ]
 num_classes: 23
 date_format: null
 gi_normalized: ""
-force_last_target: true
