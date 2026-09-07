@@ -108,6 +108,7 @@ class NonDetJacobianPenalty(nn.Module):
             Scalar tensor — mean smooth barrier over all voxels.
         """
         det_j = utils.compute_jacobian_determinant_3d(displacement, spacing)
+        self.last_determinant_minimum = det_j.detach().amin()
         return self.temperature * F.softplus(
             (self.epsilon - det_j) / self.temperature
         ).mean()

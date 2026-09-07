@@ -72,9 +72,6 @@ def main(args: Namespace) -> None:
         save_dir=save_dir,
         shape=config["rsize"],
         step_time=0.1,
-        temporal_conditioning=config.get("temporal_conditioning", "endpoint_ages"),
-        age_span=float(config["tn"]) - float(config["t0"]),
-        duration_scale=float(config.get("duration_scale", 4.0)),
     )
 
     # --- Trainer ---
@@ -83,7 +80,9 @@ def main(args: Namespace) -> None:
         enable_progress_bar=True,
     )
 
-    training_module.model.load_state_dict(torch.load(args.weight_path, weights_only=True))
+    training_module.model.load_state_dict(
+        torch.load(args.weight_path, map_location="cpu", weights_only=True)
+    )
     
     # Generate lightweight PNG comparisons.
     trainer.test(model=training_module, datamodule=datamodule)

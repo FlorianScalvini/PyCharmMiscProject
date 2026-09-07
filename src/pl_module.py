@@ -1,5 +1,6 @@
 # --- Standard library ---
 import os
+import json
 
 # --- Third-party ---
 import torch
@@ -39,9 +40,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         lambda_jac: float = 200.0,
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.1,
-        temporal_conditioning: str = "endpoint_ages",
-        age_span: float = 1.0,
-        duration_scale: float = 4.0,
         gradient_clip_norm: float = 1.0,
         *args,
         **kwargs,
@@ -55,9 +53,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.model = LongitudinalODERegistration(
             shape=shape,
             step_time=step_time,
-            temporal_conditioning=temporal_conditioning,
-            age_span=age_span,
-            duration_scale=duration_scale,
         )
 
         # Hyperparameters
@@ -80,6 +75,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.validation_mae_values = []
         self.validation_psnr_values = []
         self.validation_negative_jacobian_percentages = []
+        self.skipped_nonfinite_batches = 0
 
         os.makedirs(os.path.join(self.save_dir, "parcellations"), exist_ok=True)
         os.makedirs(os.path.join(self.save_dir, "images"), exist_ok=True)
@@ -184,20 +180,69 @@ class RegistrationLongitudinal(pl.LightningModule):
             + self.lambda_jac * loss_jac
         )
         optimizer.zero_grad() # type: ignore
+        if self._any_rank_has_nonfinite(loss.detach()):
+            self._skip_nonfinite_batch(optimizer, ages, "loss")
+            return
+
         self.manual_backward(loss)
-        self._log_gradient_diagnostics()
-        gradient_norm_before_clip = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), getattr(self, "gradient_clip_norm", 1.0)
+        gradients_finite = all(
+            parameter.grad is None or torch.isfinite(parameter.grad).all()
+            for parameter in self.model.parameters()
         )
+        if self._any_rank_flag(not gradients_finite):
+            self._skip_nonfinite_batch(optimizer, ages, "gradients")
+            return
+
+        self._log_gradient_diagnostics()
+        parameter_norm = torch.linalg.vector_norm(
+            torch.stack([
+                torch.linalg.vector_norm(parameter.detach())
+                for parameter in self.model.parameters()
+            ])
+        )
+        gradient_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            getattr(self, "gradient_clip_norm", 1.0),
+            error_if_nonfinite=True,
+        )
+        clipped_gradients = gradient_norm_before_clip > getattr(
+            self, "gradient_clip_norm", 1.0
+        )
+        clipped_gradient_values = [
+            parameter.grad.detach()
+            for parameter in self.model.parameters()
+            if parameter.grad is not None
+        ]
+        gradient_norm_after_clip = torch.linalg.vector_norm(
+            torch.stack([
+                torch.linalg.vector_norm(gradient)
+                for gradient in clipped_gradient_values
+            ])
+        )
+        learning_rate = optimizer.param_groups[0]["lr"]
+        update_ratio = (
+            learning_rate * gradient_norm_after_clip / parameter_norm.clamp_min(1e-12)
+        )
+        self.log_dict(
+            {
+                "Optimization/LearningRate": learning_rate,
+                "Optimization/GradientNormBeforeClip": gradient_norm_before_clip.detach(),
+                "Optimization/GradientNormAfterClip": gradient_norm_after_clip.detach(),
+                "Optimization/GradientClipped": clipped_gradients.float().detach(),
+                "Optimization/ParameterNorm": parameter_norm,
+                "Optimization/UpdateRatioProxy": update_ratio.detach(),
+            },
+            on_step=True, on_epoch=True, batch_size=1, sync_dist=True,
+        )
+        optimizer.step() # type: ignore
         self.log(
-            "Optimization/GradientNormBeforeClip",
-            gradient_norm_before_clip.detach(),
+            "Optimization/SkippedNonFiniteBatch",
+            0.0,
             on_step=True,
             on_epoch=True,
             batch_size=1,
             sync_dist=True,
         )
-        optimizer.step() # type: ignore
 
         final_displacement = all_phi[-1].detach() - grid_voxel
         final_jacobian = utils.compute_jacobian_determinant_3d(final_displacement)
@@ -220,6 +265,39 @@ class RegistrationLongitudinal(pl.LightningModule):
             ).amax(),
             "Train/Loss/JacobianRaw": loss_jac.detach(),
         }
+        ode_diagnostics = getattr(self.model, "last_ode_diagnostics", {})
+        step_diagnostics = {
+            "Train/Step/LossTotal": loss.detach(),
+            "Train/Step/LossSimilarity": loss_sim.detach(),
+            "Train/Step/LossRegularizationRaw": loss_reg.detach(),
+            "Train/Step/LossJacobianRaw": loss_jac.detach(),
+            "Train/Step/AgeInitialNormalized": ages[0].detach(),
+            "Train/Step/AgeFinalNormalized": ages[-1].detach(),
+            "Train/Step/DurationNormalized": integration_duration.detach(),
+        }
+        ode_log_names = {
+            "DiffusionRawMean": "Train/Step/LossDiffusionRawMean",
+            "VelocityAmplitudeRawMean": "Train/Step/LossVelocityAmplitudeRawMean",
+            "VelocityMeanNorm": "Train/Velocity/MeanNorm",
+            "VelocityMaxNorm": "Train/Velocity/MaxNorm",
+            "VelocityRMS": "Train/Velocity/RMS",
+            "TrajectoryMinimumJacobian": "Train/Trajectory/MinimumJacobian",
+            "TrajectoryMaximumDisplacement": "Train/Trajectory/MaximumDisplacement",
+            "TauAtMaximumVelocity": "Train/Trajectory/TauAtMaximumVelocity",
+            "TauAtMinimumJacobian": "Train/Trajectory/TauAtMinimumJacobian",
+        }
+        step_diagnostics.update({
+            log_name: ode_diagnostics[name]
+            for name, log_name in ode_log_names.items()
+            if name in ode_diagnostics
+        })
+        anomaly = (
+            final_jacobian.amin() < 0.1
+            or gradient_norm_before_clip > 10.0
+        )
+        step_diagnostics["Optimization/AnomalyDetected"] = loss.new_tensor(
+            float(anomaly)
+        )
 
         self.log_dict(
             {
@@ -242,6 +320,24 @@ class RegistrationLongitudinal(pl.LightningModule):
             batch_size=1,
             sync_dist=True,
         )
+        self.log_dict(
+            step_diagnostics,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            batch_size=1,
+            sync_dist=True,
+        )
+        if anomaly and self.trainer.is_global_zero:
+            age_values = ", ".join(f"{age:.6f}" for age in ages.detach().cpu())
+            maximum_velocity = ode_diagnostics.get("VelocityMaxNorm")
+            self.print(
+                f"Training anomaly at global_step={self.global_step} "
+                f"batch_idx={batch_idx} normalized_ages=[{age_values}] "
+                f"jacobian_min={float(final_jacobian.amin()):.6g} "
+                f"gradient_norm={float(gradient_norm_before_clip):.6g} "
+                f"maximum_velocity={float(maximum_velocity) if maximum_velocity is not None else float('nan'):.6g}"
+            )
         self.log(
             "Train/Loss/Total",
             loss.detach(),
@@ -256,6 +352,37 @@ class RegistrationLongitudinal(pl.LightningModule):
         del all_phi, grid_voxel, loss, loss_sim, loss_reg
         # ── always flush at end of step ──
         torch.cuda.empty_cache()
+
+    def _any_rank_has_nonfinite(self, value: torch.Tensor) -> bool:
+        """Return whether a scalar/tensor is non-finite on at least one rank."""
+        return self._any_rank_flag(not bool(torch.isfinite(value).all()))
+
+    def _any_rank_flag(self, local_flag: bool) -> bool:
+        """Synchronize a failure flag so every DDP rank takes the same branch."""
+        invalid = torch.tensor(local_flag, device=self.device, dtype=torch.int32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(invalid, op=dist.ReduceOp.MAX)
+        return bool(invalid.item())
+
+    def _skip_nonfinite_batch(self, optimizer, ages: torch.Tensor, stage: str) -> None:
+        """Discard a non-finite update while keeping all DDP ranks synchronized."""
+        optimizer.zero_grad(set_to_none=True)
+        self.skipped_nonfinite_batches += 1
+        self.log(
+            "Optimization/SkippedNonFiniteBatch",
+            1.0,
+            on_step=True,
+            on_epoch=True,
+            batch_size=1,
+            sync_dist=True,
+        )
+        if self.trainer.is_global_zero:
+            age_values = ", ".join(f"{age:.6f}" for age in ages.detach().cpu())
+            self.print(
+                f"Skipping non-finite batch at global_step={self.global_step} "
+                f"stage={stage} normalized_ages=[{age_values}] "
+                f"total_skipped={self.skipped_nonfinite_batches}"
+            )
 
     def _log_gradient_diagnostics(self) -> None:
         """Log gradient magnitudes and periodically record the output head."""
@@ -439,13 +566,6 @@ class RegistrationLongitudinal(pl.LightningModule):
                 axial_comparison.detach().cpu(),
                 global_step=self.global_step,
             )
-            if hasattr(self.logger.experiment, "add_text"):
-                age_values = ", ".join(f"{age:.4f}" for age in ages.tolist())
-                self.logger.experiment.add_text(
-                    f"Validation/Axial/Sequence_{batch_idx:02d}_Normalized_Ages",
-                    age_values,
-                    global_step=self.global_step,
-                )
 
     def on_validation_epoch_end(self) -> None:
         """Log global validation means and select the checkpoint using global LNCC."""
@@ -528,11 +648,12 @@ class RegistrationLongitudinal(pl.LightningModule):
     # ──────────────────────────────────────────────────────────────────────────
 
     def on_test_start(self) -> None:
-        """Create the directory used for lightweight test visualisations."""
+        """Create output directories and reset test-set accumulators."""
         os.makedirs(os.path.join(self.save_dir, "png"), exist_ok=True)
+        self.test_results = []
 
     def test_step(self, batch: tuple, batch_idx: int) -> None:
-        """Save central target/registered slices as PNG files."""
+        """Register every visit and save per-visit metrics and PNG comparisons."""
         images, _segs, ages, _has_segs = batch
         shape = images[0].shape[2:]
         scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
@@ -551,10 +672,49 @@ class RegistrationLongitudinal(pl.LightningModule):
         )
         grid_voxel = (grid + 1.0) / 2.0 * scale_factor
         slice_index = shape[-1] // 2
+        sequence_paths = None
+        test_dataloaders = getattr(self.trainer, "test_dataloaders", None)
+        if test_dataloaders:
+            dataset = test_dataloaders[0].dataset
+            if hasattr(dataset, "data") and batch_idx < len(dataset.data):
+                sequence_paths = dataset.data[batch_idx]
 
         for time_idx in range(1, images.shape[0]):
             df = all_phi[time_idx] - grid_voxel
             warped = registration.warp(initial_img, df)
+            target = images[time_idx:time_idx + 1].float()
+            lncc = self.loss_sim(warped, target)
+            mae = F.l1_loss(warped, target)
+            mse = F.mse_loss(warped, target)
+            psnr = 10.0 * torch.log10(
+                warped.new_tensor(1.0) / mse.clamp_min(1e-10)
+            )
+            jacobian = utils.compute_jacobian_determinant_3d(df)
+            displacement_max = torch.linalg.vector_norm(df, dim=1).amax()
+            self.test_results.append(
+                {
+                    "sequence": batch_idx,
+                    "visit": time_idx,
+                    "source_image": sequence_paths[0][0] if sequence_paths else None,
+                    "target_image": sequence_paths[time_idx][0] if sequence_paths else None,
+                    "source_age_normalized": float(ages[0].cpu()),
+                    "target_age_normalized": float(ages[time_idx].cpu()),
+                    "lncc": float(lncc.cpu()),
+                    "mae": float(mae.cpu()),
+                    "psnr": float(psnr.cpu()),
+                    "jacobian_minimum": float(jacobian.amin().cpu()),
+                    "jacobian_percent_negative": float(
+                        (100.0 * (jacobian < 0).float().mean()).cpu()
+                    ),
+                    "jacobian_percent_below_005": float(
+                        (100.0 * (jacobian < 0.05).float().mean()).cpu()
+                    ),
+                    "jacobian_percent_below_01": float(
+                        (100.0 * (jacobian < 0.1).float().mean()).cpu()
+                    ),
+                    "maximum_displacement": float(displacement_max.cpu()),
+                }
+            )
             target_slice = utils.normalize_to_0_1(
                 images[time_idx, 0, :, :, slice_index]
             ).detach().cpu()
@@ -573,3 +733,45 @@ class RegistrationLongitudinal(pl.LightningModule):
                 padding=4,
                 pad_value=1.0,
             )
+
+    def on_test_epoch_end(self) -> None:
+        """Log test-set means and write reproducible per-visit results."""
+        if not self.test_results:
+            return
+
+        mean_metrics = {
+            key: sum(result[key] for result in self.test_results) / len(self.test_results)
+            for key in (
+                "lncc", "mae", "psnr", "jacobian_percent_negative",
+                "jacobian_percent_below_005", "jacobian_percent_below_01",
+                "maximum_displacement",
+            )
+        }
+        minimum_jacobian = min(
+            result["jacobian_minimum"] for result in self.test_results
+        )
+        self.log_dict(
+            {
+                "Test/Intensity/LNCC": mean_metrics["lncc"],
+                "Test/Intensity/MAE": mean_metrics["mae"],
+                "Test/Intensity/PSNR": mean_metrics["psnr"],
+                "Test/Deformation/JacobianMinimum": minimum_jacobian,
+                "Test/Deformation/NegativeJacobianPercent": mean_metrics["jacobian_percent_negative"],
+                "Test/Deformation/JacobianPercentBelow005": mean_metrics["jacobian_percent_below_005"],
+                "Test/Deformation/JacobianPercentBelow01": mean_metrics["jacobian_percent_below_01"],
+                "Test/Deformation/MaximumDisplacement": mean_metrics["maximum_displacement"],
+            },
+            sync_dist=False,
+        )
+        if self.trainer.is_global_zero:
+            output = {
+                "summary": {
+                    **mean_metrics,
+                    "jacobian_minimum": minimum_jacobian,
+                    "number_of_sequences": len({result["sequence"] for result in self.test_results}),
+                    "number_of_registered_visits": len(self.test_results),
+                },
+                "visits": self.test_results,
+            }
+            with open(os.path.join(self.save_dir, "test_results.json"), "w") as file:
+                json.dump(output, file, indent=2)

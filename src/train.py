@@ -256,9 +256,6 @@ def main(args: Namespace) -> None:
         lambda_jac=args.lambda_jac,
         shape=config["rsize"],
         step_time=0.1,
-        temporal_conditioning=config.get("temporal_conditioning", "endpoint_ages"),
-        age_span=float(config["tn"]) - float(config["t0"]),
-        duration_scale=float(config.get("duration_scale", 4.0)),
         gradient_clip_norm=args.gradient_clip_norm,
     )
 
@@ -282,6 +279,7 @@ def main(args: Namespace) -> None:
         ],
         val_check_interval=args.val_check_interval,
         check_val_every_n_epoch=None,
+        log_every_n_steps=1,
         enable_progress_bar=True,
     )
     trainer.fit(model=training_module, datamodule=datamodule, ckpt_path=args.checkpoint)

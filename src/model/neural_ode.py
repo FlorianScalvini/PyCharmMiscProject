@@ -74,16 +74,10 @@ class LongitudinalODERegistration(nn.Module):
         self,
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.05,
-        temporal_conditioning: str = "endpoint_ages",
-        age_span: float = 1.0,
-        duration_scale: float = 4.0,
     ) -> None:
         super().__init__()
         self.velocity_net = VelocityNet(
             shape=shape,
-            temporal_conditioning=temporal_conditioning,
-            age_span=age_span,
-            duration_scale=duration_scale,
         )
         self.jacobian_loss = losses.NonDetJacobianPenalty()
         self.step_time = step_time
@@ -149,6 +143,7 @@ class LongitudinalODERegistration(nn.Module):
             method="rk4",
             options={"step_size": self.step_time},
         )
+        self.last_ode_diagnostics = ode_func.summarize_diagnostics()
         return phi_traj, loss_reg_traj[-1], loss_jac_traj[-1]
 
 
@@ -198,6 +193,16 @@ class ODEFunction(nn.Module):
         self.source_age_normalized = source_age_normalized
         self.target_age_normalized = target_age_normalized
         self.duration_normalized = target_age_normalized - source_age_normalized
+        self.diagnostics: dict[str, list[torch.Tensor]] = {
+            "EvaluationTime": [],
+            "DiffusionRawMean": [],
+            "VelocityAmplitudeRawMean": [],
+            "VelocityMeanNorm": [],
+            "VelocityMaxNorm": [],
+            "VelocityRMS": [],
+            "TrajectoryMinimumJacobian": [],
+            "TrajectoryMaximumDisplacement": [],
+        }
 
     def forward(
         self,
@@ -233,16 +238,67 @@ class ODEFunction(nn.Module):
             self.imageA,
             self.imageB,
         )
-        loss_v: torch.Tensor = self.loss_v(v)
+        diffusion_loss: torch.Tensor = self.loss_v(v)
+        loss_velocity_amplitude = v.square().mean()
+        loss_v = diffusion_loss + 0.01 * loss_velocity_amplitude
         shape = phi_t.shape[2:]
         scale = phi_t.new_tensor(shape).view(1, 3, 1, 1, 1)
         displacement_voxel = (phi_t - self.identity_grid) * (scale - 1) / 2.0
         loss_jac: torch.Tensor = self.loss_jac(displacement_voxel)
+        velocity_norm = torch.linalg.vector_norm(v.detach(), dim=1)
+        self.diagnostics["EvaluationTime"].append(t.detach())
+        self.diagnostics["DiffusionRawMean"].append(diffusion_loss.detach())
+        self.diagnostics["VelocityAmplitudeRawMean"].append(
+            loss_velocity_amplitude.detach()
+        )
+        self.diagnostics["VelocityMeanNorm"].append(velocity_norm.mean())
+        self.diagnostics["VelocityMaxNorm"].append(velocity_norm.amax())
+        self.diagnostics["VelocityRMS"].append(
+            loss_velocity_amplitude.detach().sqrt()
+        )
+        determinant_minimum = getattr(
+            self.loss_jac, "last_determinant_minimum", None
+        )
+        if determinant_minimum is None:
+            determinant_minimum = compute_jacobian_determinant_3d(
+                displacement_voxel.detach()
+            ).amin()
+        self.diagnostics["TrajectoryMinimumJacobian"].append(determinant_minimum)
+        self.diagnostics["TrajectoryMaximumDisplacement"].append(
+            torch.linalg.vector_norm(displacement_voxel.detach(), dim=1).amax()
+        )
         # The ODE is parameterized by relative time tau in [0, 1].
         # |d age / d tau| keeps accumulated losses positive in both temporal
         # directions and converts their integral back to the absolute-age scale.
         absolute_duration = torch.abs(self.duration_normalized)
         return v, loss_v * absolute_duration, loss_jac * absolute_duration
+
+    def summarize_diagnostics(self) -> dict[str, torch.Tensor]:
+        """Reduce ODE-evaluation diagnostics to one scalar per training batch."""
+        summary = {}
+        for name, values in self.diagnostics.items():
+            if name == "EvaluationTime":
+                continue
+            stacked = torch.stack(values)
+            if name in {
+                "VelocityMaxNorm",
+                "TrajectoryMaximumDisplacement",
+            }:
+                summary[name] = stacked.amax()
+            elif name == "TrajectoryMinimumJacobian":
+                summary[name] = stacked.amin()
+            else:
+                summary[name] = stacked.mean()
+        evaluation_times = torch.stack(self.diagnostics["EvaluationTime"])
+        maximum_velocity_index = torch.stack(
+            self.diagnostics["VelocityMaxNorm"]
+        ).argmax()
+        minimum_jacobian_index = torch.stack(
+            self.diagnostics["TrajectoryMinimumJacobian"]
+        ).argmin()
+        summary["TauAtMaximumVelocity"] = evaluation_times[maximum_velocity_index]
+        summary["TauAtMinimumJacobian"] = evaluation_times[minimum_jacobian_index]
+        return summary
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -281,21 +337,9 @@ class VelocityNet(nn.Module):
         shape: list[int] = [192, 224, 192],
         t_dim: int = 48,
         t_dim_enc: int = 16,
-        temporal_conditioning: str = "endpoint_ages",
-        age_span: float = 1.0,
-        duration_scale: float = 4.0,
     ) -> None:
         super().__init__()
-        if temporal_conditioning not in {"endpoint_ages", "relative_duration"}:
-            raise ValueError(f"unknown temporal conditioning: {temporal_conditioning}")
-        if age_span <= 0:
-            raise ValueError("age_span must be positive")
-        if duration_scale <= 0:
-            raise ValueError("duration_scale must be positive")
         self.shape = shape
-        self.temporal_conditioning = temporal_conditioning
-        self.age_span = float(age_span)
-        self.duration_scale = float(duration_scale)
         self.register_buffer(
             "grid",
             registration.generate_grid3d_tensor(self.shape),
@@ -321,9 +365,8 @@ class VelocityNet(nn.Module):
         self.temp_enc = SinusoidalPositionEmbeddings(
             self.t_dim_enc, max_periods=100
         )
-        temporal_inputs = 2 if temporal_conditioning == "relative_duration" else 3
         self.time_mlp = nn.Sequential(
-            nn.Linear(temporal_inputs * self.t_dim_enc, self.t_dim, bias=True),
+            nn.Linear(3 * self.t_dim_enc, self.t_dim, bias=True),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -389,12 +432,7 @@ class VelocityNet(nn.Module):
             age_init = age_init.expand(B)
         if age_final.dim() == 0:
             age_final = age_final.expand(B)
-        temporal_values = [t_relative]
-        if self.temporal_conditioning == "relative_duration":
-            duration = (age_final - age_init) * self.age_span / self.duration_scale
-            temporal_values.append(duration)
-        else:
-            temporal_values.extend([age_init, age_final])
+        temporal_values = [t_relative, age_init, age_final]
         temporal_context = torch.cat(
             [self.temp_enc(value) for value in temporal_values],
             dim=-1,
