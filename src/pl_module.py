@@ -361,12 +361,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             grid,
         )
         grid_voxel = (grid + 1.) / 2. * scale_factor
-        visualize_sequence = (
-            batch_idx < 10
-            and self.trainer.is_global_zero
-            and self.logger is not None
-            and hasattr(self.logger.experiment, "add_image")
-        )
+        visualize_sequence = True
         axial_index = shape[-1] // 2
         target_slices = []
         warped_slices = []
