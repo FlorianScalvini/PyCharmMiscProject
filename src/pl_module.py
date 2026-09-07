@@ -31,17 +31,18 @@ class RegistrationLongitudinal(pl.LightningModule):
 
     def __init__(
         self,
-        learning_rate: float = 0.01,
+        learning_rate: float = 0.001,
         save_dir: str = "",
         lambda_seg: float = 1,
         lambda_reg: float = 0.001,
         lambda_sim: float = 0.0,
-        lambda_jac: float = 0.000001,
+        lambda_jac: float = 200.0,
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.1,
         temporal_conditioning: str = "endpoint_ages",
         age_span: float = 1.0,
         duration_scale: float = 4.0,
+        gradient_clip_norm: float = 1.0,
         *args,
         **kwargs,
     ) -> None:
@@ -64,6 +65,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.lambda_sim = lambda_sim
         self.lambda_seg = lambda_seg
         self.lambda_jac = lambda_jac
+        if gradient_clip_norm <= 0:
+            raise ValueError("gradient_clip_norm must be positive")
+        self.gradient_clip_norm = gradient_clip_norm
         # Loss functions and metrics
         self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=7) # type: ignore
         self.loss_reg = losses.Grad3d('l2')
@@ -182,7 +186,40 @@ class RegistrationLongitudinal(pl.LightningModule):
         optimizer.zero_grad() # type: ignore
         self.manual_backward(loss)
         self._log_gradient_diagnostics()
+        gradient_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), getattr(self, "gradient_clip_norm", 1.0)
+        )
+        self.log(
+            "Optimization/GradientNormBeforeClip",
+            gradient_norm_before_clip.detach(),
+            on_step=True,
+            on_epoch=True,
+            batch_size=1,
+            sync_dist=True,
+        )
         optimizer.step() # type: ignore
+
+        final_displacement = all_phi[-1].detach() - grid_voxel
+        final_jacobian = utils.compute_jacobian_determinant_3d(final_displacement)
+        # Quantiles on a regular sample avoid sorting every voxel of the 3-D field.
+        jacobian_sample = final_jacobian.flatten()[::4096]
+        jacobian_quantiles = torch.quantile(
+            jacobian_sample.float(),
+            final_jacobian.new_tensor([0.01, 0.05, 0.5], dtype=torch.float32),
+        )
+        jacobian_diagnostics = {
+            "Train/Jacobian/Minimum": final_jacobian.amin(),
+            "Train/Jacobian/Quantile01": jacobian_quantiles[0],
+            "Train/Jacobian/Quantile05": jacobian_quantiles[1],
+            "Train/Jacobian/Median": jacobian_quantiles[2],
+            "Train/Jacobian/PercentNegative": 100.0 * (final_jacobian < 0).float().mean(),
+            "Train/Jacobian/PercentBelow005": 100.0 * (final_jacobian < 0.05).float().mean(),
+            "Train/Jacobian/PercentBelow01": 100.0 * (final_jacobian < 0.1).float().mean(),
+            "Train/Deformation/MaximumDisplacement": torch.linalg.vector_norm(
+                final_displacement, dim=1
+            ).amax(),
+            "Train/Loss/JacobianRaw": loss_jac.detach(),
+        }
 
         self.log_dict(
             {
@@ -192,6 +229,14 @@ class RegistrationLongitudinal(pl.LightningModule):
                 "Train/Loss/Jacobian": (self.lambda_jac * loss_jac).detach(),
             },
             on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=1,
+            sync_dist=True,
+        )
+        self.log_dict(
+            jacobian_diagnostics,
+            on_step=True,
             on_epoch=True,
             prog_bar=False,
             batch_size=1,

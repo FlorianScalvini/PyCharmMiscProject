@@ -23,7 +23,7 @@ PROJECT_DIR=/lustre/fswork/projects/rech/crp/ulq73oz/IABM2025/PyCharmMiscProject
 cd "$PROJECT_DIR"
 
 lambda_reg_values=(10)
-lambda_jac_values=(1000)
+lambda_jac_values=(200)
 
 lambda_reg=${lambda_reg_values[$SLURM_ARRAY_TASK_ID]}
 lambda_jac=${lambda_jac_values[$SLURM_ARRAY_TASK_ID]}
@@ -33,6 +33,8 @@ srun python -u src/train.py \
     --dataset "$PROJECT_DIR/data/NewEngland.yaml" \
     --lambda_reg "$lambda_reg" \
     --lambda_jac "$lambda_jac" \
+    --learning_rate 0.001 \
+    --gradient_clip_norm 1.0 \
     --lambda_seg 0 \
     --lambda_sim 1 \
     --max_epochs 5000 \

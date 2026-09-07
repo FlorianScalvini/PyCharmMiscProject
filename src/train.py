@@ -126,7 +126,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.005,
+        default=0.001,
         help="Optimizer learning rate.",
     )
     parser.add_argument(
@@ -151,8 +151,14 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_jac",
         type=float,
-        default=1,
+        default=200,
         help="Weight for the Jacobian-determinant loss term.",
+    )
+    parser.add_argument(
+        "--gradient_clip_norm",
+        type=float,
+        default=1.0,
+        help="Maximum global gradient norm before each optimizer step.",
     )
     parser.add_argument(
         "--precision",
@@ -253,6 +259,7 @@ def main(args: Namespace) -> None:
         temporal_conditioning=config.get("temporal_conditioning", "endpoint_ages"),
         age_span=float(config["tn"]) - float(config["t0"]),
         duration_scale=float(config.get("duration_scale", 4.0)),
+        gradient_clip_norm=args.gradient_clip_norm,
     )
 
     # --- Trainer ---

@@ -79,12 +79,16 @@ class NonDetJacobianPenalty(nn.Module):
     """Smooth barrier on small Jacobian determinants (folding prevention).
 
     Uses a temperature-scaled softplus approximation of
-    ``relu(epsilon - det(J))``.  This penalises folds and creates a small
-    positive safety margin before the determinant reaches zero.
+    ``relu(epsilon - det(J))``. The default wider transition starts providing
+    a gradient before the determinant reaches the safety margin.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, epsilon: float = 0.1, temperature: float = 0.05) -> None:
         super().__init__()
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        self.epsilon = float(epsilon)
+        self.temperature = float(temperature)
 
     def forward(
         self,
@@ -104,10 +108,8 @@ class NonDetJacobianPenalty(nn.Module):
             Scalar tensor — mean smooth barrier over all voxels.
         """
         det_j = utils.compute_jacobian_determinant_3d(displacement, spacing)
-        epsilon = 0.05
-        temperature = 0.01
-        return temperature * F.softplus(
-            (epsilon - det_j) / temperature
+        return self.temperature * F.softplus(
+            (self.epsilon - det_j) / self.temperature
         ).mean()
 
 
