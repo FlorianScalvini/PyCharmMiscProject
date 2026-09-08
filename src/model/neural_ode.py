@@ -6,9 +6,8 @@ Architecture overview
 The module is built around three tightly coupled classes that together
 implement a continuous-time deformable registration pipeline:
 
-1. **VelocityNet** – a time-conditioned 3-D U-Net that takes the
-   concatenation of the source image, the currently warped image, and the
-   target image as input and predicts a dense 3-D velocity field ``v(t)``.
+1. **VelocityNet** – a time-conditioned 3-D U-Net that takes the source and
+   target images as input and predicts a dense Eulerian velocity field ``v(t)``.
    Temporal context (current integration time *t*, start age *tA*, end age
    *tB*) is encoded with sinusoidal embeddings and injected into every
    encoder / decoder block through a shared time MLP.
@@ -234,16 +233,18 @@ class ODEFunction(nn.Module):
             t,
             self.source_age_normalized,
             self.target_age_normalized,
-            phi_t,
             self.imageA,
             self.imageB,
         )
+        # Eulerian flow equation: every point follows the common spatial
+        # velocity field evaluated at its current position.
+        dphi = registration.sample_normalized_vector_field(v, phi_t)
         diffusion_loss: torch.Tensor = self.loss_v(v)
         loss_velocity_amplitude = v.square().mean()
         loss_v = diffusion_loss + 0.01 * loss_velocity_amplitude
-        shape = phi_t.shape[2:]
-        scale = phi_t.new_tensor(shape).view(1, 3, 1, 1, 1)
-        displacement_voxel = (phi_t - self.identity_grid) * (scale - 1) / 2.0
+        displacement_voxel = registration.normalized_map_to_voxel_displacement(
+            phi_t, self.identity_grid
+        )
         loss_jac: torch.Tensor = self.loss_jac(displacement_voxel)
         velocity_norm = torch.linalg.vector_norm(v.detach(), dim=1)
         self.diagnostics["EvaluationTime"].append(t.detach())
@@ -271,7 +272,7 @@ class ODEFunction(nn.Module):
         # |d age / d tau| keeps accumulated losses positive in both temporal
         # directions and converts their integral back to the absolute-age scale.
         absolute_duration = torch.abs(self.duration_normalized)
-        return v, loss_v * absolute_duration, loss_jac * absolute_duration
+        return dphi, loss_v * absolute_duration, loss_jac * absolute_duration
 
     def summarize_diagnostics(self) -> dict[str, torch.Tensor]:
         """Reduce ODE-evaluation diagnostics to one scalar per training batch."""
@@ -308,10 +309,9 @@ class ODEFunction(nn.Module):
 class VelocityNet(nn.Module):
     """Time-conditioned 3-D U-Net that predicts a dense velocity field.
 
-    The network concatenates three volumes — the source image *imageA*, the
-    current warped image ``warp(imageA, φ_t - grid)``, and the target image
-    *imageB* — into a 3-channel input and processes it through a symmetric
-    encoder–decoder with skip connections.
+    The network concatenates the fixed source and target images into a
+    2-channel input. It predicts a time-dependent Eulerian velocity field;
+    the ODE function evaluates this field at the current point positions.
 
     Relative time and the dataset-normalized first and last ages are encoded
     with sinusoidal embeddings followed by a 3-layer SiLU MLP. Relative time
@@ -329,8 +329,6 @@ class VelocityNet(nn.Module):
         Dimensionality of the raw sinusoidal time encoding before the MLP.
     """
 
-    grid: torch.Tensor
-
     def __init__(
         self,
         reg_head_chan: int = 16,
@@ -340,15 +338,10 @@ class VelocityNet(nn.Module):
     ) -> None:
         super().__init__()
         self.shape = shape
-        self.register_buffer(
-            "grid",
-            registration.generate_grid3d_tensor(self.shape),
-            persistent=False,
-        )
         self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
         self.encoder = EncoderUnet(
-            in_channels=3, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
+            in_channels=2, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
         )
         self.decoder_0 = UnetUpBlock(
             in_channels=256, out_channels=128, kernel_size=3, t_dim=self.t_dim
@@ -390,7 +383,6 @@ class VelocityNet(nn.Module):
         t_relative: torch.Tensor,
         age_init: torch.Tensor,
         age_final: torch.Tensor,
-        phi_t: torch.Tensor,
         image_A: torch.Tensor,
         image_B: torch.Tensor,
     ) -> torch.Tensor:
@@ -407,9 +399,6 @@ class VelocityNet(nn.Module):
             Dataset-normalized first acquisition age, scalar or shape ``(B,)``.
         age_final : torch.Tensor
             Dataset-normalized last acquisition age, scalar or shape ``(B,)``.
-        phi_t : torch.Tensor
-            Current deformation field of shape ``(B, 3, D, H, W)`` in
-            normalised ``[-1, 1]`` coordinates.
         image_A : torch.Tensor
             Source image ``(B, 1, H, W, D)``.
         image_B : torch.Tensor
@@ -419,12 +408,8 @@ class VelocityNet(nn.Module):
         v : torch.Tensor
             Predicted velocity field of shape ``(B, 3, D, H, W)``.
         """
-        # Match the voxel displacement used by the external loss warping.
-        scale = phi_t.new_tensor(image_A.shape[2:]).view(1, 3, 1, 1, 1)
-        df = (phi_t - self.grid) * (scale - 1) / 2
-        warped = registration.warp(image_A, df)
-        net_input = torch.cat([image_A, warped, image_B], dim=1)
-        B: int = phi_t.shape[0]
+        net_input = torch.cat([image_A, image_B], dim=1)
+        B: int = image_A.shape[0]
 
         if t_relative.dim() == 0:
             t_relative = t_relative.expand(B)

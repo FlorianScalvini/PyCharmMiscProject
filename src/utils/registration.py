@@ -29,6 +29,7 @@ from collections.abc import Sequence
 # --- Third-party ---
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 from monai.networks.blocks.warp import Warp
 
 
@@ -90,6 +91,56 @@ def generate_grid3d_tensor(shape: Sequence[int]) -> Tensor:
     z = torch.linspace(-1., 1., shape[2])
     x, y, z = torch.meshgrid(x, y, z, indexing='ij')
     return torch.stack([z, y, x], dim=0)   # (3, D, H, W)
+
+
+def normalized_map_to_voxel_displacement(
+    deformation: Tensor,
+    identity: Tensor,
+) -> Tensor:
+    """Convert an absolute normalized XYZ map to a voxel D-H-W displacement."""
+    if deformation.ndim != 5 or deformation.shape[1] != 3:
+        raise ValueError("deformation must have shape (B, 3, D, H, W)")
+    if identity.ndim == 4:
+        identity = identity.unsqueeze(0)
+    if identity.shape[1:] != deformation.shape[1:] or identity.shape[0] not in {
+        1, deformation.shape[0]
+    }:
+        raise ValueError("identity must be broadcastable to deformation")
+    d, h, w = deformation.shape[2:]
+    xyz_scale = deformation.new_tensor([w - 1, h - 1, d - 1]).view(
+        1, 3, 1, 1, 1
+    )
+    displacement_xyz = (deformation - identity) * xyz_scale / 2.0
+    return displacement_xyz[:, [2, 1, 0]]
+
+
+def normalized_map_to_voxel_map(deformation: Tensor) -> Tensor:
+    """Convert an absolute normalized XYZ map to absolute voxel D-H-W coordinates."""
+    if deformation.ndim != 5 or deformation.shape[1] != 3:
+        raise ValueError("deformation must have shape (B, 3, D, H, W)")
+    d, h, w = deformation.shape[2:]
+    xyz_scale = deformation.new_tensor([w - 1, h - 1, d - 1]).view(
+        1, 3, 1, 1, 1
+    )
+    voxel_xyz = (deformation + 1.0) * xyz_scale / 2.0
+    return voxel_xyz[:, [2, 1, 0]]
+
+
+def sample_normalized_vector_field(
+    vector_field: Tensor,
+    deformation: Tensor,
+) -> Tensor:
+    """Evaluate a normalized XYZ vector field at an absolute normalized map."""
+    if vector_field.shape != deformation.shape:
+        raise ValueError("vector_field and deformation must have the same shape")
+    sampling_grid = deformation.permute(0, 2, 3, 4, 1)
+    return F.grid_sample(
+        vector_field,
+        sampling_grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

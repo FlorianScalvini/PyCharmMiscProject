@@ -92,7 +92,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="/home/florian/PyCharmMiscProject/data/adni.yaml",
+        default="/home/florian/PyCharmMiscProject/data/babofet.yaml",
         help="Path to the dataset configuration file.",
     )
     parser.add_argument(
@@ -132,14 +132,14 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_seg",
         type=float,
-        default=0.0,
+        default=1,
         help="Weight for the segmentation loss term.",
     )
 
     parser.add_argument(
         "--lambda_sim",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Weight for the image-similarity loss term.",
     )
     parser.add_argument(
@@ -151,7 +151,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_jac",
         type=float,
-        default=200,
+        default=10,
         help="Weight for the Jacobian-determinant loss term.",
     )
     parser.add_argument(
@@ -176,7 +176,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--val_check_interval",
         type=int,
-        default=100,
+        default=20,
         help="Run validation every N training iterations, across epochs.",
     )
     parser.add_argument(

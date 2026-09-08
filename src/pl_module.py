@@ -76,6 +76,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.validation_psnr_values = []
         self.validation_negative_jacobian_percentages = []
         self.skipped_nonfinite_batches = 0
+        self.validation_dice_values = []
 
         os.makedirs(os.path.join(self.save_dir, "parcellations"), exist_ok=True)
         os.makedirs(os.path.join(self.save_dir, "images"), exist_ok=True)
@@ -93,17 +94,16 @@ class RegistrationLongitudinal(pl.LightningModule):
         grid: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the ODE registration and rescale deformation fields to voxel space."""
-        shape = source.shape[2:]
-        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
-            1, 3, 1, 1, 1
-        )
         all_phi, loss_reg, loss_jac = self.model(
             source,
             target,
             ages,
             grid,
         )
-        all_phi = (all_phi + 1.) / 2. * scale_factor
+        all_phi = torch.stack([
+            registration.normalized_map_to_voxel_map(phi)
+            for phi in all_phi
+        ])
         return all_phi, loss_reg, loss_jac
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -122,9 +122,6 @@ class RegistrationLongitudinal(pl.LightningModule):
 
         images, segs, ages, has_segs = batch
         shape = images[0].shape[2:]
-        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
-            1, 3, 1, 1, 1
-        )
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
 
         images = images.squeeze(0)
@@ -148,7 +145,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             grid,
         )
         
-        grid_voxel = (grid + 1.) / 2. * scale_factor
+        grid_voxel = registration.normalized_map_to_voxel_map(grid)
 
         for idx in range(1, images.shape[0]):
             phi = all_phi[idx]
@@ -291,13 +288,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             for name, log_name in ode_log_names.items()
             if name in ode_diagnostics
         })
-        anomaly = (
-            final_jacobian.amin() < 0.1
-            or gradient_norm_before_clip > 10.0
-        )
-        step_diagnostics["Optimization/AnomalyDetected"] = loss.new_tensor(
-            float(anomaly)
-        )
+       
 
         self.log_dict(
             {
@@ -328,16 +319,6 @@ class RegistrationLongitudinal(pl.LightningModule):
             batch_size=1,
             sync_dist=True,
         )
-        if anomaly and self.trainer.is_global_zero:
-            age_values = ", ".join(f"{age:.6f}" for age in ages.detach().cpu())
-            maximum_velocity = ode_diagnostics.get("VelocityMaxNorm")
-            self.print(
-                f"Training anomaly at global_step={self.global_step} "
-                f"batch_idx={batch_idx} normalized_ages=[{age_values}] "
-                f"jacobian_min={float(final_jacobian.amin()):.6g} "
-                f"gradient_norm={float(gradient_norm_before_clip):.6g} "
-                f"maximum_velocity={float(maximum_velocity) if maximum_velocity is not None else float('nan'):.6g}"
-            )
         self.log(
             "Train/Loss/Total",
             loss.detach(),
@@ -466,15 +447,36 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.validation_mae_values = []
         self.validation_psnr_values = []
         self.validation_negative_jacobian_percentages = []
+        self.validation_dice_values = []
+
+    @staticmethod
+    def _validation_dice(prediction: torch.Tensor, target: torch.Tensor):
+        """MONAI macro Dice including background and false-positive classes.
+
+        Remap sparse label IDs jointly to avoid allocating unused classes.
+        Labels absent from both maps (except background) are not evaluated.
+        """
+        labels = torch.unique(torch.cat((
+            prediction.long().flatten(), target.long().flatten(),
+            target.new_zeros(1, dtype=torch.long),
+        )))
+        prediction_indices = torch.searchsorted(labels, prediction.long())
+        target_indices = torch.searchsorted(labels, target.long())
+        metric = monai.metrics.DiceMetric(
+            include_background=True,
+            reduction="mean",
+            ignore_empty=False,
+            num_classes=labels.numel(),
+        )
+        metric(y_pred=prediction_indices, y=target_indices)
+        return metric.aggregate().squeeze()
 
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
         """Compute metrics and visualise the first ten validation sequences."""
-        images, _segs, ages, _has_segs = batch
+        images, segs, ages, has_segs = batch
+        has_segs = has_segs.squeeze(0).bool()
         shape = images[0].shape[2:]
-        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
-            1, 3, 1, 1, 1
-        )
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
         images = images.squeeze(0)
         ages = ages.squeeze(0).to(self.device)
@@ -487,8 +489,17 @@ class RegistrationLongitudinal(pl.LightningModule):
             ages,
             grid,
         )
-        grid_voxel = (grid + 1.) / 2. * scale_factor
+        grid_voxel = registration.normalized_map_to_voxel_map(grid)
         visualize_sequence = True
+        source_one_hot = None
+        if bool(has_segs[0]):
+            source_labels = segs[:, 0, 0].long().to(self.device)
+            label_values, label_indices = torch.unique(
+                source_labels, sorted=True, return_inverse=True
+            )
+            source_one_hot = F.one_hot(
+                label_indices, num_classes=label_values.numel()
+            ).movedim(-1, 1).float()
         axial_index = shape[-1] // 2
         target_slices = []
         warped_slices = []
@@ -506,6 +517,19 @@ class RegistrationLongitudinal(pl.LightningModule):
             df = all_phi[idx] - grid_voxel
             warped = registration.warp(initial_img, df)
             target = images[idx:idx + 1].float()
+            if source_one_hot is not None and bool(has_segs[idx]):
+                warped_probabilities = registration.warp(
+                    source_one_hot, df, mode="bilinear"
+                )
+                warped_seg = label_values[
+                    warped_probabilities.argmax(dim=1, keepdim=True)
+                ]
+                del warped_probabilities
+                dice = self._validation_dice(
+                    warped_seg, segs[:, idx].to(self.device)
+                )
+                if dice is not None:
+                    self.validation_dice_values.append(float(dice.cpu()))
             if self.lambda_sim > 0:
                 intensity_loss = self.loss_sim(warped, target)
                 self.validation_intensity_losses.append(
@@ -576,6 +600,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             self.validation_mae_values,
             self.validation_psnr_values,
             self.validation_negative_jacobian_percentages,
+            self.validation_dice_values,
         )
         statistics = torch.tensor(
             [[sum(values), len(values)] for values in metric_values],
@@ -588,7 +613,13 @@ class RegistrationLongitudinal(pl.LightningModule):
             total / count if count > 0 else None
             for total, count in statistics.cpu().tolist()
         ]
-        mean_intensity_loss, mean_mae, mean_psnr, mean_negative_jacobian = global_means
+        mean_intensity_loss, mean_mae, mean_psnr, mean_negative_jacobian, mean_dice = global_means
+
+        if mean_dice is not None:
+            self.log(
+                "Validation/Segmentation/Dice", mean_dice,
+                on_step=False, on_epoch=True, prog_bar=True, sync_dist=False,
+            )
 
         if mean_intensity_loss is not None:
             self.log(
@@ -642,6 +673,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.validation_negative_jacobian_percentages = []
 
         torch.cuda.empty_cache()
+        self.validation_dice_values = []
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Test: PNG exports only
@@ -656,9 +688,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         """Register every visit and save per-visit metrics and PNG comparisons."""
         images, _segs, ages, _has_segs = batch
         shape = images[0].shape[2:]
-        scale_factor = (torch.tensor(shape, device=self.device) - 1).view(
-            1, 3, 1, 1, 1
-        )
         grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
         images = images.squeeze(0)
         ages = ages.squeeze(0).to(self.device)
@@ -670,7 +699,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             ages,
             grid,
         )
-        grid_voxel = (grid + 1.0) / 2.0 * scale_factor
+        grid_voxel = registration.normalized_map_to_voxel_map(grid)
         slice_index = shape[-1] // 2
         sequence_paths = None
         test_dataloaders = getattr(self.trainer, "test_dataloaders", None)
