@@ -92,7 +92,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="/home/florian/PyCharmMiscProject/data/adni.yaml",
+        default="/home/florian/PyCharmMiscProject/data/babofet.yaml",
         help="Path to the dataset configuration file.",
     )
     parser.add_argument(
@@ -132,14 +132,14 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_seg",
         type=float,
-        default=0.0,
+        default=1.0,
         help="Weight for the segmentation loss term.",
     )
 
     parser.add_argument(
         "--lambda_sim",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Weight for the image-similarity loss term.",
     )
     parser.add_argument(
@@ -151,7 +151,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_jac",
         type=float,
-        default=1,
+        default=8,
         help="Weight for the Jacobian-determinant loss term.",
     )
     parser.add_argument(
@@ -164,14 +164,8 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--num_sanity_val_steps",
         type=int,
-        default=0,
+        default=30,
         help="Number of sanity validation steps before training starts.",
-    )
-    parser.add_argument(
-        "--limit_val_batches",
-        type=int,
-        default=5,
-        help="Maximum validation sequences per validation epoch (default: 5).",
     )
     parser.add_argument(
         "--check_val_every_n_epoch",
@@ -205,7 +199,7 @@ def main(args: Namespace) -> None:
         config: Dict[str, Any] = yaml.safe_load(f)
 
     # --- Output directory ---
-    dir_name: str = datetime.now().strftime("%y_%d_%H_%M")
+    dir_name: str = datetime.now().strftime("%y_%m_%d_%H_%M_%S")
     save_dir: str = os.path.join("./", "results", config["name"], "train", dir_name)
     if os.path.exists(save_dir):
         # create versioned directory if the base directory already exists
@@ -227,6 +221,9 @@ def main(args: Namespace) -> None:
         num_workers=args.num_workers,
         size=config["rsize"],
         crop=config["csize"],
+        t0=config["t0"],
+        tn=config["tn"],
+        merge_labels_0_1=config.get("merge_labels_0_1", False),
     )
 
     # --- Model ---
@@ -238,7 +235,7 @@ def main(args: Namespace) -> None:
         lambda_sim=args.lambda_sim,
         lambda_jac=args.lambda_jac,
         shape=config["rsize"],
-        step_time=0.1,
+        step_time=0.05,
     )
 
     # --- Trainer ---
@@ -246,7 +243,6 @@ def main(args: Namespace) -> None:
         max_epochs=args.max_epochs,
         precision=args.precision,
         num_sanity_val_steps=args.num_sanity_val_steps,
-        limit_val_batches=args.limit_val_batches,
         logger=tensorboard_logger,
         callbacks=[
             ModelCheckpoint(
@@ -259,7 +255,8 @@ def main(args: Namespace) -> None:
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         enable_progress_bar=True,
     )
-    trainer.fit(model=training_module, datamodule=datamodule, ckpt_path=args.checkpoint)
+    #training_module.model.load_state_dict(torch.load("/home/florian/PyCharmMiscProject/results/babofet/train/26_21_11_14/last_registration.pt"))
+    trainer.fit(model=training_module, datamodule=datamodule, ckpt_path="/home/florian/PyCharmMiscProject/results/babofet/train/26_10_11_30/last.ckpt")
 
 
 if __name__ == "__main__":

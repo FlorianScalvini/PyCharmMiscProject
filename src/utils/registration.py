@@ -11,7 +11,7 @@ registration pipeline:
   normalised sampling grid compatible with ``torch.nn.functional.grid_sample``
   (``displacement2grid``).
 * **Image warping** – apply a voxel-space displacement field to deform an
-  image volume (``warp``).
+  image volume (``warp_with_phi``).
 
 Coordinate convention
 ---------------------
@@ -29,7 +29,7 @@ from collections.abc import Sequence
 # --- Third-party ---
 import torch
 from torch import Tensor
-from monai.networks.blocks.warp import Warp
+from torch.nn import functional as F
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -92,6 +92,38 @@ def generate_grid3d_tensor(shape: Sequence[int]) -> Tensor:
     return torch.stack([z, y, x], dim=0)   # (3, D, H, W)
 
 
+def sample_vector_field(vector_field: Tensor, phi: Tensor) -> Tensor:
+    """Sample a vector field at the coordinates of a deformation map.
+
+    Both tensors use shape ``(B, 3, D, H, W)``. ``phi`` contains absolute
+    coordinates normalized to ``[-1, 1]`` and ordered as expected by
+    :func:`torch.nn.functional.grid_sample`.
+    """
+    if vector_field.shape != phi.shape:
+        raise ValueError(
+            "vector_field and phi must have the same shape, got "
+            f"{tuple(vector_field.shape)} and {tuple(phi.shape)}"
+        )
+    return warp_with_phi(vector_field, phi)
+
+
+def warp_with_phi(image: Tensor, phi: Tensor, mode: str = "bilinear") -> Tensor:
+    """Warp an image with an absolute deformation in normalized coordinates."""
+    if image.ndim != 5 or phi.ndim != 5 or phi.shape[1] != 3:
+        raise ValueError(
+            "expected image (B,C,D,H,W) and phi (B,3,D,H,W), got "
+            f"{tuple(image.shape)} and {tuple(phi.shape)}"
+        )
+    sampling_grid = phi.permute(0, 2, 3, 4, 1)
+    return F.grid_sample(
+        image,
+        sampling_grid,
+        mode=mode,
+        padding_mode="border",
+        align_corners=True,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Coordinate conversion
 # ──────────────────────────────────────────────────────────────────────────────
@@ -126,31 +158,19 @@ def displacement2grid(flow: Tensor) -> Tensor:
     normalized_grid = grid.clone()
     for i, dim in enumerate(normalized_grid.shape[1:-1]):
         normalized_grid[..., i] = normalized_grid[..., i] * 2 / (dim - 1) - 1
-    return normalized_grid
+    return normalized_grid.flip(-1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Image warping
-# ──────────────────────────────────────────────────────────────────────────────
 
-def warp(image: Tensor, flow: Tensor, mode: str = 'bilinear') -> Tensor:
-    """Deform *image* using the voxel-space displacement field *flow*.
+def phi_to_displacement_voxel(phi: Tensor, identity: Tensor | None = None) -> Tensor:
+    """Convert normalized XYZ maps to voxel displacements ordered D,H,W.
 
-    Internally delegates to ``monai.networks.blocks.Warp``, which calls
-    ``F.grid_sample`` after converting *flow* to a normalised grid.
-    Out-of-bounds coordinates are handled with reflection padding to avoid
-    black border artefacts.
-
-    Args:
-        image: Moving image of shape ``(B, C, D, H, W)``.
-        flow:  Displacement field of shape ``(B, 3, D, H, W)`` in voxel units,
-               with the same spatial extent as *image*.
-        mode:  Interpolation mode forwarded to ``grid_sample``
-               (``'bilinear'`` or ``'nearest'``).  Defaults to ``'bilinear'``.
-
-    Returns:
-        Warped image of shape ``(B, C, D, H, W)`` on the same device as
-        *image*.
+    This conversion is reserved for Jacobian calculations and flow exports.
+    Warping uses the normalized absolute map directly.
     """
-    warper = Warp(mode=mode, padding_mode='reflection')
-    return warper(image, flow)
+    if phi.ndim != 5 or phi.shape[1] != 3:
+        raise ValueError("phi must have shape (B,3,D,H,W)")
+    if identity is None:
+        identity = generate_grid3d_tensor(phi.shape[2:]).to(phi).unsqueeze(0)
+    scale = phi.new_tensor([size - 1 for size in phi.shape[2:]]).view(1, 3, 1, 1, 1) / 2
+    return (phi - identity).flip(1) * scale

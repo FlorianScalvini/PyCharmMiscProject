@@ -57,9 +57,9 @@ class LongitudinalODERegistration(nn.Module):
     """Longitudinal registration model driven by a neural ODE.
 
     Given a pair of images and a sorted sequence of acquisition ages, the
-        model maps the source time to ``0`` and the selected target time to
-        ``1`` before integrating. Sessions after the target consequently have
-        relative times greater than ``1``.
+    model integrates a time-varying velocity field from ``ages[0]`` to
+    ``ages[-1]`` and returns the deformation trajectories together with
+    the cumulative regularisation loss.
 
     Parameters
     ----------
@@ -113,15 +113,12 @@ class LongitudinalODERegistration(nn.Module):
             Cumulative regularisation loss accumulated up to the final
             time step (scalar).
         """
-        duration = ages_target - ages[0]
-        if torch.any(duration <= 0):
-            raise ValueError("ages_target must be strictly greater than ages[0]")
-        relative_ages = (ages - ages[0]) / duration
-
         ode_func = ODEFunction(
             self.velocity_net,
             imageA,
             imageB,
+            ages[0],
+            ages_target,
             identity_grid=grid,
             loss_jac=self.jacobian_loss,
             loss_v=loss_v,
@@ -134,7 +131,7 @@ class LongitudinalODERegistration(nn.Module):
                 zero,
                 zero.clone(),
             ),  # initial state: (phi₀, loss_reg₀, loss_jac₀)
-            relative_ages,
+            ages,
             method="rk4",
             options={"step_size": self.step_time},
         )
@@ -161,6 +158,10 @@ class ODEFunction(nn.Module):
         Source image ``(B, 1, H, W, D)``, kept constant during integration.
     imageB : torch.Tensor
         Target image ``(B, 1, H, W, D)``, kept constant during integration.
+    ageA : torch.Tensor
+        Scalar tensor — age at the start of the integration interval.
+    ageB : torch.Tensor
+        Scalar tensor — age at the end of the integration interval.
     loss_v : nn.Module
         Velocity regularisation loss module (e.g. diffusion or bending
         energy) evaluated at each ODE step.
@@ -171,6 +172,8 @@ class ODEFunction(nn.Module):
         vnet: nn.Module,
         imageA: torch.Tensor,
         imageB: torch.Tensor,
+        ageA: torch.Tensor,
+        ageB: torch.Tensor,
         identity_grid: torch.Tensor,
         loss_jac: nn.Module,
         loss_v: nn.Module = monai.losses.DiffusionLoss(normalize=True), # type: ignore
@@ -179,6 +182,8 @@ class ODEFunction(nn.Module):
         self.vnet = vnet
         self.imageA = imageA
         self.imageB = imageB
+        self.ageA = ageA
+        self.ageB = ageB
         self.identity_grid = identity_grid
         self.loss_v = loss_v
         self.loss_jac = loss_jac
@@ -201,21 +206,23 @@ class ODEFunction(nn.Module):
 
         Returns
         -------
-        v : torch.Tensor
-            Predicted velocity field ``(B, 3, D, H, W)`` — the time
-            derivative ``dφ/dt`` at the current state.
+        dphi : torch.Tensor
+            Velocity sampled at the current deformation coordinates,
+            ``v(t, φ_t(x))``, with shape ``(B, 3, D, H, W)``.
         loss_v : torch.Tensor
             Velocity regularisation loss at the current step (scalar),
             accumulated into the state for later retrieval.
         """
         phi_t = state[0]
-        v = self.vnet(t, phi_t, self.imageA, self.imageB)
+        v = self.vnet(t, phi_t, self.imageA, self.imageB, self.ageA, self.ageB)
+        dphi = registration.sample_vector_field(v, phi_t)
         loss_v: torch.Tensor = self.loss_v(v)
-        shape = phi_t.shape[2:]
-        scale = phi_t.new_tensor(shape).view(1, 3, 1, 1, 1)
-        displacement_voxel = (phi_t - self.identity_grid) * scale / 2.0
+        displacement_voxel = registration.phi_to_displacement_voxel(
+            phi_t, self.identity_grid
+        )
         loss_jac: torch.Tensor = self.loss_jac(displacement_voxel)
-        return v, loss_v, loss_jac
+        direction = torch.sign(self.ageB - self.ageA)
+        return dphi, loss_v * direction, loss_jac * direction
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -230,9 +237,10 @@ class VelocityNet(nn.Module):
     *imageB* — into a 3-channel input and processes it through a symmetric
     encoder–decoder with skip connections.
 
-    Relative time is encoded with a sinusoidal position embedding followed by
-    a 3-layer SiLU MLP. Source time is ``0``, target time is ``1``, and values
-    greater than ``1`` represent observations after the selected target.
+    Temporal information is encoded by mapping the tuple
+    ``(t_normalised, tA, tB)`` through sinusoidal position embeddings and
+    a 3-layer SiLU MLP, producing a time embedding vector that is injected
+    into every encoder and decoder block via feature-wise modulation.
 
     Parameters
     ----------
@@ -255,7 +263,6 @@ class VelocityNet(nn.Module):
     ) -> None:
         super().__init__()
         self.shape = shape
-        self.grid = registration.generate_grid3d_tensor(self.shape).cuda()
         self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
         self.encoder = EncoderUnet(
@@ -297,11 +304,15 @@ class VelocityNet(nn.Module):
         phi_t: torch.Tensor,
         image_A: torch.Tensor,
         image_B: torch.Tensor,
+        ageA: torch.Tensor,
+        ageB: torch.Tensor,
     ) -> torch.Tensor:
         """Predict the velocity field at integration time *t*.
 
-        ``t`` is already relative: source is ``0``, selected target is ``1``,
-        and later observations may have ``t > 1``.
+        The normalised time ``(t - ageA) / (ageB - ageA)`` is used so the
+        network receives a value in ``[0, 1]`` regardless of the absolute
+        age range, making it easier to learn temporal patterns across
+        different developmental windows.
 
         Parameters
         ----------
@@ -314,19 +325,32 @@ class VelocityNet(nn.Module):
             Source image ``(B, 1, H, W, D)``.
         image_B : torch.Tensor
             Target image ``(B, 1, H, W, D)``.
+        ageA : torch.Tensor
+            Start age of the integration interval, broadcastable to ``(B,)``.
+        ageB : torch.Tensor
+            End age of the integration interval, broadcastable to ``(B,)``.
+
         Returns
         -------
         v : torch.Tensor
             Predicted velocity field of shape ``(B, 3, D, H, W)``.
         """
-        df = phi_t - self.grid
-        warped = registration.warp(image_A, df)
+        warped = registration.warp_with_phi(image_A, phi_t)
         net_input = torch.cat([image_A, warped, image_B], dim=1)
         B: int = phi_t.shape[0]
 
         if t.dim() == 0:
             t = t.expand(B)
-        t_all: torch.Tensor = self.time_mlp(self.temp_enc(t))
+        if ageA.dim() == 0:
+            ageA = ageA.expand(B)
+        if ageB.dim() == 0:
+            ageB = ageB.expand(B)
+
+        t_enc: torch.Tensor = self.temp_enc((t - ageA) / (ageB - ageA + 1e-5))
+        #ageA_enc: torch.Tensor = self.temp_enc(ageA)
+        #ageB_enc: torch.Tensor = self.temp_enc(ageB)
+        t_all: torch.Tensor = torch.cat([t_enc], dim=1)
+        t_all = self.time_mlp(t_all)
 
         feat_maps = self.encoder(net_input, t_all)
         v = self.decoder_0(feat_maps[4], feat_maps[3], t_all)

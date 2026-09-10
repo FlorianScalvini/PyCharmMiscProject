@@ -117,6 +117,8 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         Target spatial dimensions ``(D, H, W)`` after resizing.
     crop : tuple of int
         Crop/pad target ``(D, H, W)`` applied before resizing.
+    merge_labels_0_1 : bool
+        Merge labels 0 and 1 and shift higher labels down by one.
     """
 
     def __init__(
@@ -127,9 +129,11 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         batch_size: int,
         seed: int = 42,
         num_workers: int = 4,
+        t0: float = 0,
+        tn: float = 1,
         size: tuple[int, int, int] = (192, 224, 192),
         crop: tuple[int, int, int] = (50, 50, 50),
-
+        merge_labels_0_1: bool = False,
     ) -> None:
         super().__init__()
         self.root_dir = root_dir
@@ -145,6 +149,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         self.seed = seed
         self.size = size
         self.crop = crop
+        self.merge_labels_0_1 = merge_labels_0_1
         self.transform = tio.transforms.Compose([
             tio.transforms.CropOrPad(crop),
             tio.transforms.Resize(size),
@@ -156,7 +161,6 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         ])
         self.data_train: list = []
         self.data_val: list = []
-        segmentation_presence: list[bool] = []
 
         with open(self.json_path, 'r') as f:
             # Parsing the JSON file into a Python dictionary
@@ -165,16 +169,16 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         for i in range(len(data['subjects'])):
             subject = []
             for j in range(len(data['subjects'][i]['sessions'])):
-                segmentation = data['subjects'][i]['sessions'][j].get('segmentation')
-                segmentation_presence.append(segmentation is not None)
                 session = [
                     root_dir + data['subjects'][i]['sessions'][j]['image'],
-                    root_dir + segmentation if segmentation is not None else None,
+                    root_dir + data['subjects'][i]['sessions'][j]['segmentation'],
                     data['subjects'][i]['sessions'][j]['age'],
                 ]
                 subject.append(session)
 
             subject.sort(key=lambda session: session[2])
+            for j in range(len(subject)):
+                subject[j][2] = (subject[j][2] - t0) / (tn - t0)
             if len(subject) >= 2:
                 self.data_train.append(subject)
 
@@ -184,17 +188,16 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         for i in range(len(data['subjects'])):
             subject = []
             for j in range(len(data['subjects'][i]['sessions'])):
-                segmentation = data['subjects'][i]['sessions'][j].get('segmentation')
-                segmentation_presence.append(segmentation is not None)
                 session = [
                     root_dir + data['subjects'][i]['sessions'][j]['image'],
-                    root_dir + segmentation if segmentation is not None else None,
+                    root_dir + data['subjects'][i]['sessions'][j]['segmentation'],
                     data['subjects'][i]['sessions'][j]['age'],
                 ]
-               
                 subject.append(session)
 
             subject.sort(key=lambda session: session[2])
+            for j in range(len(subject)):
+                subject[j][2] = (subject[j][2] - t0) / (tn - t0)
             if len(subject) >= 2:
                 self.data_val.append(subject)
 
@@ -202,12 +205,6 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
             raise ValueError("the training manifest contains no sequence with at least 2 sessions")
         if not self.data_val:
             raise ValueError("the validation manifest contains no sequence with at least 2 sessions")
-        if any(segmentation_presence) and not all(segmentation_presence):
-            raise ValueError(
-                "segmentation availability must be dataset-wide: either every "
-                "session has a segmentation or none of them does"
-            )
-        self.has_segmentation = all(segmentation_presence)
 
     def _loader_kwargs(self, *, shuffle: bool, pin_memory: bool) -> dict:
         """Build DataLoader options shared by arbitrary numbers of sequences."""
@@ -228,7 +225,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         dataset = SpatioTemporalDataset(
             self.data_train,
             self.transform,
-            has_segmentation=self.has_segmentation,
+            merge_labels_0_1=self.merge_labels_0_1,
         )
         return torch.utils.data.DataLoader(
             dataset=dataset, **self._loader_kwargs(shuffle=True, pin_memory=True)
@@ -238,7 +235,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         """Return an ordered DataLoader over the validation subjects."""
         dataset = SpatioTemporalDatasetValidation(
             self.data_val, self.transform, self.transform_seg,
-            has_segmentation=self.has_segmentation,
+            merge_labels_0_1=self.merge_labels_0_1,
         )
         return torch.utils.data.DataLoader(
             dataset=dataset, **self._loader_kwargs(shuffle=False, pin_memory=False)
@@ -248,7 +245,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         """Return an ordered DataLoader over the validation subjects for testing."""
         dataset = SpatioTemporalDatasetValidation(
             self.data_val, self.transform, self.transform_seg,
-            has_segmentation=self.has_segmentation,
+            merge_labels_0_1=self.merge_labels_0_1,
         )
         return torch.utils.data.DataLoader(
             dataset=dataset, **self._loader_kwargs(shuffle=False, pin_memory=False)
