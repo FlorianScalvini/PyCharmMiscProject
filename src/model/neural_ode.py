@@ -266,7 +266,7 @@ class VelocityNet(nn.Module):
         self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
         self.encoder = EncoderUnet(
-            in_channels=2, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
+            in_channels=3, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
         )
         self.decoder_0 = UnetUpBlock(
             in_channels=256, out_channels=128, kernel_size=3, t_dim=self.t_dim
@@ -338,8 +338,8 @@ class VelocityNet(nn.Module):
         v : torch.Tensor
             Predicted velocity field of shape ``(B, 3, D, H, W)``.
         """
-
-        net_input = torch.cat([image_A, image_B], dim=1)
+        warped = registration.warp_with_phi(image_A, phi_t)
+        net_input = torch.cat([image_A, warped, image_B], dim=1)
         B: int = phi_t.shape[0]
 
         if t.dim() == 0:

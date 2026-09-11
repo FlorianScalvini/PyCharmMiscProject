@@ -45,6 +45,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         lambda_reg: float = 0.001,
         lambda_sim: float = 0.0,
         lambda_jac: float = 0.000001,
+        gradient_clip_norm: float = 1.0,
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.1,
         *args,
@@ -63,6 +64,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.lambda_sim = lambda_sim
         self.lambda_seg = lambda_seg
         self.lambda_jac = lambda_jac
+        self.gradient_clip_norm = gradient_clip_norm
         # Loss functions and metrics
         self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=21) # type: ignore
         self.loss_reg = losses.Grad3d('l2')
@@ -155,6 +157,12 @@ class RegistrationLongitudinal(pl.LightningModule):
         )
         optimizer.zero_grad() # type: ignore
         self.manual_backward(loss)
+        if self.gradient_clip_norm > 0:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=self.gradient_clip_norm,
+                gradient_clip_algorithm="norm",
+            )
         optimizer.step() # type: ignore
 
         # One subject sequence per step; keep only the total in the progress bar.

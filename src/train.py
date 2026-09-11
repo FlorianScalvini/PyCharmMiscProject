@@ -83,6 +83,8 @@ def parse_args() -> Namespace:
             Run validation every N epochs.
         checkpoint_every_n_steps : int
             Save a checkpoint every N training steps.
+        gradient_clip_norm : float
+            Maximum gradient norm; zero disables gradient clipping.
     """
     parser = argparse.ArgumentParser(
         description="Train the longitudinal brain MRI registration model."
@@ -128,6 +130,12 @@ def parse_args() -> Namespace:
         type=float,
         default=0.001,
         help="Optimizer learning rate.",
+    )
+    parser.add_argument(
+        "--gradient_clip_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm (0 disables clipping).",
     )
     parser.add_argument(
         "--lambda_seg",
@@ -234,6 +242,7 @@ def main(args: Namespace) -> None:
         lambda_reg=args.lambda_reg,
         lambda_sim=args.lambda_sim,
         lambda_jac=args.lambda_jac,
+        gradient_clip_norm=args.gradient_clip_norm,
         shape=config["rsize"],
         step_time=0.05,
     )
@@ -256,7 +265,7 @@ def main(args: Namespace) -> None:
         enable_progress_bar=True,
     )
     #training_module.model.load_state_dict(torch.load("/home/florian/PyCharmMiscProject/results/babofet/train/26_21_11_14/last_registration.pt"))
-    trainer.fit(model=training_module, datamodule=datamodule, ckpt_path="/home/florian/PyCharmMiscProject/results/babofet/train/26_10_11_30/last.ckpt")
+    trainer.fit(model=training_module, datamodule=datamodule, ckpt_path=args.checkpoint if args.checkpoint is not None else None)
 
 
 if __name__ == "__main__":
