@@ -157,13 +157,17 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.manual_backward(loss)
         optimizer.step() # type: ignore
 
+        # One subject sequence per step; keep only the total in the progress bar.
+        self.log(
+            "train/loss", loss.detach(),
+            on_step=False, on_epoch=True, prog_bar=True, batch_size=1,
+        )
         self.log_dict({
-            'loss_G': loss.item(),
-            'loss_sim': (self.lambda_sim * loss_sim).item(),
-            'loss_seg': (self.lambda_seg * loss_seg).item(),
-            'loss_reg': (self.lambda_reg * loss_reg).item(),
-            'loss_jac': (self.lambda_jac * loss_jac).item(),
-        }, on_step=False, on_epoch=True, prog_bar=True)
+            "train/loss_sim": (self.lambda_sim * loss_sim).detach(),
+            "train/loss_seg": (self.lambda_seg * loss_seg).detach(),
+            "train/loss_reg": (self.lambda_reg * loss_reg).detach(),
+            "train/loss_jac": (self.lambda_jac * loss_jac).detach(),
+        }, on_step=False, on_epoch=True, prog_bar=False, batch_size=1)
 
         # ── critical: free the ODE trajectory ──
         del all_phi, loss, loss_sim, loss_reg
@@ -327,19 +331,20 @@ class RegistrationLongitudinal(pl.LightningModule):
         combined = torch.stack(all_targets + all_registered + all_segs)
         grid_visualization = make_grid(combined, nrow=num_times, padding=5, pad_value=1.0)
         self.logger.experiment.add_image(  # type: ignore
-            f"Temporal_Comparison/sequence_{batch_idx}",
+            f"val/images/sequence_{batch_idx:03d}",
             grid_visualization,
-            global_step=self.current_epoch,
+            global_step=self.global_step,
         )
         del combined, grid_visualization
 
     def on_validation_epoch_end(self) -> None:
         """Log aggregated metrics and grid images; save model if a new Dice best is reached."""
-        if not self.table_result_data:  # skip sanity check
+        if self.trainer.sanity_checking or not self.table_result_data:
+            self.table_result_data = []
             self.seg_metrics.reset()
             return
 
-        step = self.current_epoch
+        step = self.global_step
 
         dice_vals = [row[1] for row in self.table_result_data]
         jac_vals = [row[2] for row in self.table_result_data]
@@ -347,16 +352,16 @@ class RegistrationLongitudinal(pl.LightningModule):
         # Log per-sample scalars
         for row in self.table_result_data:
             sample_id, dice, nb_jac_neg = row
-            self.logger.experiment.add_scalar(f"Dice/{sample_id}", dice, global_step=step) # type: ignore
-            self.logger.experiment.add_scalar(f"JacNeg/{sample_id}", nb_jac_neg, global_step=step) # type: ignore
+            self.logger.experiment.add_scalar(f"val/samples/{sample_id}/dice", dice, global_step=step) # type: ignore
+            self.logger.experiment.add_scalar(f"val/samples/{sample_id}/jac_neg_count", nb_jac_neg, global_step=step) # type: ignore
 
         mean_dice = float(np.mean(dice_vals))
-        # Log mean dice and jac
-        self.log("Val/mean_dice", mean_dice, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("Val/mean_jac_neg", float(np.mean(jac_vals)), on_step=False, on_epoch=True, prog_bar=True)
-
-        self.logger.experiment.add_scalar("Val/mean_dice", mean_dice, global_step=step) # type: ignore
-        self.logger.experiment.add_scalar("Val/mean_jac_neg", float(np.mean(jac_vals)), global_step=step) # type: ignore
+        # Lightning writes each aggregate once, on the same global-step axis.
+        self.log("val/dice", mean_dice, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(
+            "val/jac_neg_count", float(np.mean(jac_vals)),
+            on_step=False, on_epoch=True, prog_bar=True,
+        )
 
         # Reset
         self.table_result_data = []
