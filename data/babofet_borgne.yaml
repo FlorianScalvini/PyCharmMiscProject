@@ -1,4 +1,4 @@
-name: 'babofet'
+name: 'babofet_borgne'
 root_dir: /home/florian/Documents/Dataset/Babofet/borgne/
 train_json: data.json
 val_json: data.json
@@ -13,4 +13,3 @@ prediction_labels_merged: false
 date_format: null
 csize: [ 192, 224, 128 ]
 rsize: [ 192, 224, 128 ]
-load_surface: true
