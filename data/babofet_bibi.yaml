@@ -4,7 +4,7 @@ train_json: data.json
 val_json: data.json
 label_metadata: labels_metadata.json
 gi_normalized: null
-t0: 88
+t0: 92
 tn: 161
 num_classes: 4
 merge_labels_0_1: true

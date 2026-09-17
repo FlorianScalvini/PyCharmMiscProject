@@ -1,11 +1,11 @@
 name: 'babofet'
 root_dir: /home/florian/Documents/Dataset/Babofet/fabienne
 train_json: data.json
-val_json: datdataa_val.json
+val_json: data.json
 label_metadata: labels_metadata.json
 gi_normalized: null
-t0: 88
-tn: 161
+t0: 91
+tn: 154
 num_classes: 4
 merge_labels_0_1: true
 # False for legacy 0..4 exports; set true for predictions already merged to 0..3.
