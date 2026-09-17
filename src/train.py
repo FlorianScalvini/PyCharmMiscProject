@@ -94,7 +94,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="/home/florian/PyCharmMiscProject/data/babofet.yaml",
+        default="/home/florian/PyCharmMiscProject/data/ferret.yaml",
         help="Path to the dataset configuration file.",
     )
     parser.add_argument(
@@ -153,13 +153,13 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_reg",
         type=float,
-        default=0.5,
+        default=2,
         help="Weight for the regularisation loss term.",
     )
     parser.add_argument(
         "--lambda_jac",
         type=float,
-        default=8,
+        default=10,
         help="Weight for the Jacobian-determinant loss term.",
     )
     parser.add_argument(

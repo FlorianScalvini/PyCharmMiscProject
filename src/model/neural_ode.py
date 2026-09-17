@@ -9,8 +9,8 @@ implement a continuous-time deformable registration pipeline:
 1. **VelocityNet** – a time-conditioned 3-D U-Net that takes the
    concatenation of the source image, the currently warped image, and the
    target image as input and predicts a dense 3-D velocity field ``v(t)``.
-   Temporal context (current integration time *t*, start age *tA*, end age
-   *tB*) is encoded with sinusoidal embeddings and injected into every
+   Current age, relative position between the anchors, and their age
+   interval are encoded with sinusoidal embeddings and injected into every
    encoder / decoder block through a shared time MLP.
 
 2. **ODEFunction** – wraps :class:`VelocityNet` as the right-hand side
@@ -69,11 +69,18 @@ class LongitudinalODERegistration(nn.Module):
         Fixed step size passed to the RK4 ODE solver.  Smaller values
         increase accuracy at the cost of more :class:`VelocityNet` forward
         passes per training step.
+    use_absolute_age : bool
+        Whether to condition VelocityNet on the current absolute age.
     """
 
-    def __init__(self, shape: list[int] = [192, 224, 192], step_time: float = 0.05) -> None:
+    def __init__(
+        self,
+        shape: list[int] = [192, 224, 192],
+        step_time: float = 0.05,
+        use_absolute_age: bool = True,
+    ) -> None:
         super().__init__()
-        self.velocity_net = VelocityNet(shape=shape)
+        self.velocity_net = VelocityNet(shape=shape, use_absolute_age=use_absolute_age)
         self.jacobian_loss = losses.NonDetJacobianPenalty()
         self.step_time = step_time
 
@@ -161,7 +168,7 @@ class ODEFunction(nn.Module):
     ageA : torch.Tensor
         Scalar tensor — age at the start of the integration interval.
     ageB : torch.Tensor
-        Scalar tensor — age at the end of the integration interval.
+        Scalar tensor — age of imageB, potentially before the final integration time.
     loss_v : nn.Module
         Velocity regularisation loss module (e.g. diffusion or bending
         energy) evaluated at each ODE step.
@@ -214,7 +221,9 @@ class ODEFunction(nn.Module):
             accumulated into the state for later retrieval.
         """
         phi_t = state[0]
-        v = self.vnet(t, phi_t, self.imageA, self.imageB, self.ageA, self.ageB)
+        with torch.no_grad():
+            image_t = registration.warp_with_phi(self.imageA, phi_t)
+        v = self.vnet(t, self.imageA, image_t, self.imageB, self.ageA, self.ageB)
         dphi = registration.sample_vector_field(v, phi_t)
         loss_v: torch.Tensor = self.loss_v(v)
         displacement_voxel = registration.phi_to_displacement_voxel(
@@ -232,15 +241,15 @@ class ODEFunction(nn.Module):
 class VelocityNet(nn.Module):
     """Time-conditioned 3-D U-Net that predicts a dense velocity field.
 
-    The network concatenates three volumes — the source image *imageA*, the
-    current warped image ``warp(imageA, φ_t - grid)``, and the target image
-    *imageB* — into a 3-channel input and processes it through a symmetric
-    encoder–decoder with skip connections.
+    The network concatenates the source image, the current warped image
+    ``image_t``, and the target image into a 3-channel input and processes
+    it through a symmetric encoder–decoder with skip connections.
 
-    Temporal information is encoded by mapping the tuple
-    ``(t_normalised, tA, tB)`` through sinusoidal position embeddings and
-    a 3-layer SiLU MLP, producing a time embedding vector that is injected
-    into every encoder and decoder block via feature-wise modulation.
+    Current age, relative position
+    ``alpha = (t - ageA) / (ageB - ageA)``, and observed age interval
+    ``ageB - ageA`` are mapped through sinusoidal embeddings and a 3-layer
+    SiLU MLP. The resulting vector is injected into every encoder and
+    decoder block via feature-wise modulation.
 
     Parameters
     ----------
@@ -252,6 +261,9 @@ class VelocityNet(nn.Module):
         Dimensionality of the time embedding fed to the U-Net blocks.
     t_dim_enc : int
         Dimensionality of the raw sinusoidal time encoding before the MLP.
+    use_absolute_age : bool
+        If true, include the current age alongside relative position and
+        observed age interval. Otherwise use only the latter two values.
     """
 
     def __init__(
@@ -260,11 +272,13 @@ class VelocityNet(nn.Module):
         shape: list[int] = [192, 224, 192],
         t_dim: int = 48,
         t_dim_enc: int = 16,
+        use_absolute_age: bool = True,
     ) -> None:
         super().__init__()
         self.shape = shape
         self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
+        self.use_absolute_age = use_absolute_age
         self.encoder = EncoderUnet(
             in_channels=3, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
         )
@@ -284,7 +298,7 @@ class VelocityNet(nn.Module):
             self.t_dim_enc, max_periods=100
         )
         self.time_mlp = nn.Sequential(
-            nn.Linear(3 * self.t_dim_enc, self.t_dim, bias=True),
+            nn.Linear((3 if use_absolute_age else 2) * self.t_dim_enc, self.t_dim, bias=True),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -301,29 +315,29 @@ class VelocityNet(nn.Module):
     def forward(
         self,
         t: torch.Tensor,
-        phi_t: torch.Tensor,
         image_A: torch.Tensor,
+        image_t: torch.Tensor,
         image_B: torch.Tensor,
         ageA: torch.Tensor,
         ageB: torch.Tensor,
     ) -> torch.Tensor:
         """Predict the velocity field at integration time *t*.
 
-        The normalised time ``(t - ageA) / (ageB - ageA)`` is used so the
-        network receives a value in ``[0, 1]`` regardless of the absolute
-        age range, making it easier to learn temporal patterns across
-        different developmental windows.
-        The start and end ages are encoded separately as well, preserving
-        the absolute developmental window in the dataset's global age scale
-        (ages are normalised by the data loader, not by each subject).
+        The solver integrates in the dataset's globally normalised age
+        coordinate, so ``current_age = t``. This preserves absolute age
+        information across subjects. Relative position ``alpha`` is zero
+        at the first anchor, one at the second, and exceeds one during
+        forward extrapolation. The observed interval preserves the time
+        scale between anchors. The anchor ages must differ.
+
+        Current age is omitted when ``use_absolute_age`` is false.
 
         Parameters
         ----------
         t : torch.Tensor
             Current integration time, broadcastable to ``(B,)``.
-        phi_t : torch.Tensor
-            Current deformation field of shape ``(B, 3, D, H, W)`` in
-            normalised ``[-1, 1]`` coordinates.
+        image_t : torch.Tensor
+            Current warped source image ``(B, 1, D, H, W)``.
         image_A : torch.Tensor
             Source image ``(B, 1, H, W, D)``.
         image_B : torch.Tensor
@@ -331,16 +345,15 @@ class VelocityNet(nn.Module):
         ageA : torch.Tensor
             Start age of the integration interval, broadcastable to ``(B,)``.
         ageB : torch.Tensor
-            End age of the integration interval, broadcastable to ``(B,)``.
+            Age of the second anchor image, broadcastable to ``(B,)``.
 
         Returns
         -------
         v : torch.Tensor
             Predicted velocity field of shape ``(B, 3, D, H, W)``.
         """
-        warped = registration.warp_with_phi(image_A, phi_t)
-        net_input = torch.cat([image_A, warped, image_B], dim=1)
-        B: int = phi_t.shape[0]
+        net_input = torch.cat([image_A, image_t, image_B], dim=1)
+        B: int = image_t.shape[0]
 
         if t.dim() == 0:
             t = t.expand(B)
@@ -349,10 +362,15 @@ class VelocityNet(nn.Module):
         if ageB.dim() == 0:
             ageB = ageB.expand(B)
 
-        t_enc: torch.Tensor = self.temp_enc((t - ageA) / (ageB - ageA + 1e-5))
-        ageA_enc: torch.Tensor = self.temp_enc(ageA)
-        ageB_enc: torch.Tensor = self.temp_enc(ageB)
-        t_all: torch.Tensor = torch.cat([t_enc, ageA_enc, ageB_enc], dim=1)
+        current_age = t  # Integration uses the dataset's global age coordinate.
+        anchor_interval = ageB - ageA
+        if torch.any(anchor_interval == 0):
+            raise ValueError("anchor ages must differ to compute relative position")
+        alpha = (current_age - ageA) / anchor_interval
+        temporal_inputs = [alpha, anchor_interval]
+        if self.use_absolute_age:
+            temporal_inputs.insert(0, current_age)
+        t_all = torch.cat([self.temp_enc(value) for value in temporal_inputs], dim=1)
         t_all = self.time_mlp(t_all)
 
         feat_maps = self.encoder(net_input, t_all)

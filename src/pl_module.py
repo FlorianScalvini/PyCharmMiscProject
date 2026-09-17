@@ -48,6 +48,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         gradient_clip_norm: float = 1.0,
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.1,
+        use_absolute_age: bool = True,
         *args,
         **kwargs,
     ) -> None:
@@ -57,7 +58,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.automatic_optimization = False
         self.learning_rate = learning_rate
         # Initialize the registration and segmentation networks
-        self.model = LongitudinalODERegistration(shape=shape, step_time=step_time)
+        self.model = LongitudinalODERegistration(
+            shape=shape, step_time=step_time, use_absolute_age=use_absolute_age
+        )
 
         # Hyperparameters
         self.lambda_reg = lambda_reg
@@ -104,12 +107,12 @@ class RegistrationLongitudinal(pl.LightningModule):
     # ──────────────────────────────────────────────────────────────────────────
 
     def configure_optimizers(self) -> tuple[list, list]:
-        """Return Adam optimiser with exponential LR decay."""
+        """Return Adam with exponential learning-rate decay."""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
-        return [optimizer], [lr_scheduler]
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+        return [optimizer], [scheduler]
 
-    def training_step(self, batch: tuple, batch_idx: int) -> None:
+    def training_step(self, batch: tuple, _) -> None:
         """Compute total weighted loss, back-propagate, and log per-term metrics."""
         optimizer = self.optimizers()
 
@@ -183,7 +186,13 @@ class RegistrationLongitudinal(pl.LightningModule):
         torch.cuda.empty_cache()
 
     def on_train_epoch_end(self) -> None:
-        """Flush GPU cache and save a checkpoint at the end of each training epoch."""
+        """Advance manual scheduling once per epoch, report LR, and save weights."""
+        used_lr = self.optimizers().param_groups[0]["lr"]
+        scheduler = self.lr_schedulers()
+        scheduler.step()
+        self.log_dict({
+            "train/learning_rate": used_lr,
+        }, on_step=False, on_epoch=True, prog_bar=False, batch_size=1)
         torch.cuda.empty_cache()  # ← add this
         torch.save(self.model.state_dict(), os.path.join(self.save_dir, "last_registration.pt"))
 
@@ -231,6 +240,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         data = flow_ras_mm.permute(1, 2, 3, 0).unsqueeze(3).numpy()
         image = nib.Nifti1Image(data.astype(np.float32, copy=False), affine)
         image.header.set_intent(1006, name="displacement")
+        image.header.set_xyzt_units(xyz="mm")
         nib.save(image, output_path)
 
 
@@ -323,7 +333,7 @@ class RegistrationLongitudinal(pl.LightningModule):
                 self.seg_metrics(pred_label, F.one_hot(segs[:, idx].squeeze(0).cpu().long(),
                                                        num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3).cpu())
                 det_jac = utils.compute_jacobian_determinant_3d(df.cpu()).numpy()
-                nb_jac_neg = int(np.sum(det_jac < 0))
+                nb_jac_neg = float(np.sum(det_jac <= 0))
                 buffer = self.seg_metrics.get_buffer()
                 dice = float(buffer[-1].mean().item())
                 results = [str(batch_idx) + "_" + str(idx), dice, nb_jac_neg]
@@ -361,7 +371,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         for row in self.table_result_data:
             sample_id, dice, nb_jac_neg = row
             self.logger.experiment.add_scalar(f"val/samples/{sample_id}/dice", dice, global_step=step) # type: ignore
-            self.logger.experiment.add_scalar(f"val/samples/{sample_id}/jac_neg_count", nb_jac_neg, global_step=step) # type: ignore
+            self.logger.experiment.add_scalar(f"val/samples/{sample_id}/jac_neg_count", float(nb_jac_neg), global_step=step) # type: ignore
 
         mean_dice = float(np.mean(dice_vals))
         # Lightning writes each aggregate once, on the same global-step axis.
