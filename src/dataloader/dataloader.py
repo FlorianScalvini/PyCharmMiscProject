@@ -173,9 +173,10 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         for i in range(len(data['subjects'])):
             subject = []
             for j in range(len(data['subjects'][i]['sessions'])):
+                segmentation = data['subjects'][i]['sessions'][j].get('segmentation')
                 session = [
                     root_dir + data['subjects'][i]['sessions'][j]['image'],
-                    root_dir + data['subjects'][i]['sessions'][j]['segmentation'],
+                    root_dir + segmentation if segmentation else None,
                     data['subjects'][i]['sessions'][j]['age'],
                 ]
                 subject.append(session)
@@ -192,9 +193,10 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         for i in range(len(data['subjects'])):
             subject = []
             for j in range(len(data['subjects'][i]['sessions'])):
+                segmentation = data['subjects'][i]['sessions'][j].get('segmentation')
                 session = [
                     root_dir + data['subjects'][i]['sessions'][j]['image'],
-                    root_dir + data['subjects'][i]['sessions'][j]['segmentation'],
+                    root_dir + segmentation if segmentation else None,
                     data['subjects'][i]['sessions'][j]['age'],
                 ]
                 subject.append(session)
