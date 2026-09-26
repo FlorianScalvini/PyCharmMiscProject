@@ -232,6 +232,7 @@ def main(args: Namespace) -> None:
         t0=config["t0"],
         tn=config["tn"],
         merge_labels_0_1=config.get("merge_labels_0_1", False),
+        augmentation=config.get("augmentation", False),
     )
 
     # --- Model ---

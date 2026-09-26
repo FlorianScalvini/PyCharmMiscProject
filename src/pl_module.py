@@ -123,6 +123,13 @@ class RegistrationLongitudinal(pl.LightningModule):
         images = images.squeeze(0)
         ages = ages.squeeze(0).to(self.device)
 
+        # Start from any observed time point except the last one. Slicing the
+        # three sequences together keeps images, labels and ages aligned.
+        start_idx = torch.randint(0, images.shape[0] - 1, ()).item()
+        images = images[start_idx:]
+        segs = segs[:, start_idx:]
+        ages = ages[start_idx:]
+
         loss_sim = torch.tensor(0.0, device=self.device)
         loss_seg = torch.tensor(0.0, device=self.device)
         initial_img = images[0:1].float()

@@ -119,6 +119,8 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         Crop/pad target ``(D, H, W)`` applied before resizing.
     merge_labels_0_1 : bool
         Merge labels 0 and 1 and shift higher labels down by one.
+    augmentation : bool or tio.Transform or None
+        Enable sequence augmentation for training only, or supply a transform.
     """
 
     def __init__(
@@ -134,6 +136,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         size: tuple[int, int, int] = (192, 224, 192),
         crop: tuple[int, int, int] = (50, 50, 50),
         merge_labels_0_1: bool = False,
+        augmentation: bool | tio.Transform | None = False,
     ) -> None:
         super().__init__()
         self.root_dir = root_dir
@@ -150,6 +153,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         self.size = size
         self.crop = crop
         self.merge_labels_0_1 = merge_labels_0_1
+        self.augmentation = augmentation
         self.transform = tio.transforms.Compose([
             tio.transforms.CropOrPad(crop),
             tio.transforms.Resize(size),
@@ -225,6 +229,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         dataset = SpatioTemporalDataset(
             self.data_train,
             self.transform,
+            augmentation=self.augmentation,
             merge_labels_0_1=self.merge_labels_0_1,
         )
         return torch.utils.data.DataLoader(

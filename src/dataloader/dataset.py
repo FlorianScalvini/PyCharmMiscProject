@@ -51,8 +51,11 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
         *seg_path* may be ``None`` if no segmentation is available.
     transform : transforms.Transform or None
         Spatial transform applied to each image volume independently.
-    augmentation : transforms.Transform or None
-        Optional augmentation applied to the complete TorchIO subject.
+    augmentation : bool or transforms.Transform or None
+        True enables a shared anterior-posterior flip (probability 0.5),
+        followed by either axial rotation (+/-10 degrees) or isotropic scaling
+        (0.9-1.1), and independent blur/noise for each session. False or None
+        disables augmentation. A custom transform is applied to the sequence.
     merge_labels_0_1 : bool
         Merge labels 0 and 1 and shift higher labels down by one.
     """
@@ -61,12 +64,28 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
         self,
         data: list,
         transform: transforms.Transform | None = None,
-        augmentation: transforms.Transform | None = None,
+        augmentation: bool | transforms.Transform | None = False,
         merge_labels_0_1: bool = False,
     ) -> None:
         super().__init__()
         self.transform = transform
-        self.augmentation = augmentation
+        self.intensity_augmentation = None
+        if augmentation is True:
+            self.augmentation = tio.Compose([
+                tio.OneOf([
+                    # RandomAffine uses physical axes; Z is superior-inferior.
+                    tio.RandomAffine(scales=0, degrees=10),
+                    tio.RandomAffine(scales=(0.9, 1.1), degrees=0, isotropic=True),
+                    tio.RandomAffine(scales=(0.9, 1.1), degrees=10, isotropic=True),
+                ]),
+            ])
+            self.intensity_augmentation = tio.Compose([
+                tio.RandomBlur(std=(0, 1)),
+                # Inputs are normally rescaled to [0, 1] by the data module.
+                tio.RandomNoise(mean=0, std=(0, 0.05)),
+            ])
+        else:
+            self.augmentation = None if augmentation is False else augmentation
         self.merge_labels_0_1 = merge_labels_0_1
         self.data: list = []
         for i in range(len(data)):
@@ -101,6 +120,7 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
         time_stack = []
         seg_stack = []
         data = self.data[idx]
+        sequence_images = {}
         for i in range(len(data)):
             session = tio.Subject(
                 image=tio.ScalarImage(data[i][0]),
@@ -108,15 +128,24 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
             )
             if self.transform is not None:
                 session = self.transform(session)
-            if self.augmentation is not None:
-                session = self.augmentation(session) # type: ignore
-            mri_stack.append(session.image.data)
-            labels = session.label.data
+            sequence_images[f'image_{i}'] = session.image
+            sequence_images[f'label_{i}'] = session.label
+
+        # One call shares spatial parameters across all images and label maps.
+        sequence = tio.Subject(sequence_images)
+        if self.augmentation is not None:
+            sequence = self.augmentation(sequence)
+        for i in range(len(data)):
+            image = sequence[f'image_{i}']
+            if self.intensity_augmentation is not None:
+                # Separate calls draw fresh blur/noise parameters per time point.
+                image = self.intensity_augmentation(tio.Subject(image=image)).image
+            mri_stack.append(image.data)
+            labels = sequence[f'label_{i}'].data
             if self.merge_labels_0_1:
                 labels = _merge_first_two_labels(labels)
             seg_stack.append(labels)
             time_stack.append(data[i][2])
-            del session
 
         # ── 5. stack ──────────────────────────────────────────────────
         mri_stack_out = torch.stack(mri_stack, dim=0)  # (T_total, 1, X, Y, Z)

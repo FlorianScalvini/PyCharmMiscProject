@@ -46,7 +46,6 @@ import utils.registration as registration
 import utils.losses as losses
 from utils.utils import *
 from .unet import EncoderUnet, UnetUpBlock
-from .time_encoding import SinusoidalPositionEmbeddings
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -280,7 +279,7 @@ class VelocityNet(nn.Module):
         self.t_dim = t_dim
         self.use_absolute_age = use_absolute_age
         self.encoder = EncoderUnet(
-            in_channels=3, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
+            in_channels=1, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
         )
         self.decoder_0 = UnetUpBlock(
             in_channels=256, out_channels=128, kernel_size=3, t_dim=self.t_dim
@@ -294,11 +293,8 @@ class VelocityNet(nn.Module):
         self.decoder_3 = UnetUpBlock(
             in_channels=32, out_channels=16, kernel_size=3, t_dim=self.t_dim
         )
-        self.temp_enc = SinusoidalPositionEmbeddings(
-            self.t_dim_enc, max_periods=100
-        )
         self.time_mlp = nn.Sequential(
-            nn.Linear((3 if use_absolute_age else 2) * self.t_dim_enc, self.t_dim, bias=True),
+            nn.Linear(2 if use_absolute_age else 1, self.t_dim, bias=True),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -352,7 +348,7 @@ class VelocityNet(nn.Module):
         v : torch.Tensor
             Predicted velocity field of shape ``(B, 3, D, H, W)``.
         """
-        net_input = torch.cat([image_A, image_t, image_B], dim=1)
+        net_input = torch.cat([image_t], dim=1)
         B: int = image_t.shape[0]
 
         if t.dim() == 0:
@@ -362,17 +358,13 @@ class VelocityNet(nn.Module):
         if ageB.dim() == 0:
             ageB = ageB.expand(B)
 
-        current_age = t  # Integration uses the dataset's global age coordinate.
-        anchor_interval = ageB - ageA
-        if torch.any(anchor_interval == 0):
-            raise ValueError("anchor ages must differ to compute relative position")
-        alpha = (current_age - ageA) / anchor_interval
-        temporal_inputs = [alpha, anchor_interval]
+        current_age = t  # Global age coordinate, normalized to [0, 1].
+        elapsed_time = current_age - ageA
         if self.use_absolute_age:
-            temporal_inputs.insert(0, current_age)
-        t_all = torch.cat([self.temp_enc(value) for value in temporal_inputs], dim=1)
-        t_all = self.time_mlp(t_all)
-
+            temporal_inputs = torch.stack([current_age, elapsed_time], dim=1)
+        else:
+            temporal_inputs = elapsed_time.unsqueeze(1)
+        t_all = self.time_mlp(temporal_inputs)
         feat_maps = self.encoder(net_input, t_all)
         v = self.decoder_0(feat_maps[4], feat_maps[3], t_all)
         v = self.decoder_1(v, feat_maps[2], t_all)
