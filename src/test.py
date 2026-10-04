@@ -74,7 +74,8 @@ def main(args: Namespace) -> None:
     training_module: RegistrationLongitudinal = RegistrationLongitudinal(
         save_dir=save_dir,
         shape=config["rsize"],
-        step_time=0.1
+        rtol=1e-3,
+        atol=1e-5,
     )
 
     # --- Trainer ---

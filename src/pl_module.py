@@ -49,8 +49,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         shape: list[int] = [192, 224, 192],
         step_time: float | None = None,  # Legacy checkpoint argument; ignored.
         use_absolute_age: bool = True,
-        rtol: float = 1e-3,
-        atol: float = 1e-5,
         *args,
         **kwargs,
     ) -> None:
@@ -61,7 +59,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.learning_rate = learning_rate
         # Initialize the registration and segmentation networks
         self.model = LongitudinalODERegistration(
-            shape=shape, use_absolute_age=use_absolute_age, rtol=rtol, atol=atol
+            shape=shape, use_absolute_age=use_absolute_age
         )
 
         # Hyperparameters
