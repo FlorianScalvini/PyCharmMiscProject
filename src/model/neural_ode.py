@@ -46,6 +46,7 @@ import utils.registration as registration
 import utils.losses as losses
 from utils.utils import *
 from .unet import EncoderUnet, UnetUpBlock
+from .time_encoding import SinusoidalPositionEmbeddings
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,7 +66,7 @@ class LongitudinalODERegistration(nn.Module):
     shape : list of int
         Spatial dimensions ``[H, W, D]`` of the input volumes.
     step_time : float
-        Fixed step size passed to the RK4 ODE solver.  Smaller values
+        Fixed step size in relative anchor time (0 to 1) for RK4. Smaller values
         increase accuracy at the cost of more :class:`VelocityNet` forward
         passes per training step.
     use_absolute_age : bool
@@ -81,6 +82,8 @@ class LongitudinalODERegistration(nn.Module):
         super().__init__()
         self.velocity_net = VelocityNet(shape=shape, use_absolute_age=use_absolute_age)
         self.jacobian_loss = losses.NonDetJacobianPenalty()
+        if step_time <= 0:
+            raise ValueError("step_time must be positive")
         self.step_time = step_time
 
     def forward(
@@ -119,6 +122,16 @@ class LongitudinalODERegistration(nn.Module):
             Cumulative regularisation loss accumulated up to the final
             time step (scalar).
         """
+        if ages.ndim != 1 or ages.numel() < 2:
+            raise ValueError("ages must be a one-dimensional sequence of at least two ages")
+        if not torch.isfinite(ages).all() or not torch.isfinite(ages_target).all():
+            raise ValueError("acquisition ages must be finite")
+        interval = ages_target - ages[0]
+        if interval.numel() != 1 or interval.item() == 0:
+            raise ValueError("source and target anchor ages must differ")
+        relative_times = (ages - ages[0]) / interval
+        if not torch.all(relative_times[1:] > relative_times[:-1]):
+            raise ValueError("ages must be strictly ordered in the anchor direction")
         ode_func = ODEFunction(
             self.velocity_net,
             imageA,
@@ -137,9 +150,11 @@ class LongitudinalODERegistration(nn.Module):
                 zero,
                 zero.clone(),
             ),  # initial state: (phi₀, loss_reg₀, loss_jac₀)
-            ages,
+            relative_times,
             method="rk4",
             options={"step_size": self.step_time},
+            adjoint_method="rk4",
+            adjoint_options={"step_size": self.step_time},
         )
         return phi_traj, loss_reg_traj[-1], loss_jac_traj[-1]
 
@@ -190,6 +205,7 @@ class ODEFunction(nn.Module):
         self.imageB = imageB
         self.ageA = ageA
         self.ageB = ageB
+        self.interval = ageB - ageA
         self.identity_grid = identity_grid
         self.loss_v = loss_v
         self.loss_jac = loss_jac
@@ -199,12 +215,12 @@ class ODEFunction(nn.Module):
         t: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Evaluate the ODE right-hand side at time *t*.
+        """Evaluate the ODE right-hand side at relative anchor time *t*.
 
         Parameters
         ----------
         t : torch.Tensor
-            Current integration time (scalar tensor).
+            Relative integration time s = (age - ageA) / (ageB - ageA).
         state : tuple of torch.Tensor
             ``(phi_t, loss_reg_acc)`` — current deformation field of shape
             ``(B, 3, D, H, W)`` and the scalar accumulated regularisation
@@ -220,17 +236,20 @@ class ODEFunction(nn.Module):
             accumulated into the state for later retrieval.
         """
         phi_t = state[0]
-        with torch.no_grad():
-            image_t = registration.warp_with_phi(self.imageA, phi_t)
-        v = self.vnet(t, self.imageA, image_t, self.imageB, self.ageA, self.ageB)
+        current_age = self.ageA + t * self.interval
+        image_t = registration.warp_with_phi(self.imageA, phi_t)
+        v = self.vnet(current_age, self.imageA, image_t, self.imageB, self.ageA, self.ageB)
         dphi = registration.sample_vector_field(v, phi_t)
         loss_v: torch.Tensor = self.loss_v(v)
         displacement_voxel = registration.phi_to_displacement_voxel(
             phi_t, self.identity_grid
         )
         loss_jac: torch.Tensor = self.loss_jac(displacement_voxel)
-        direction = torch.sign(self.ageB - self.ageA)
-        return dphi, loss_v * direction, loss_jac * direction
+        return (
+            dphi * self.interval,
+            loss_v * self.interval.abs(),
+            loss_jac * self.interval.abs(),
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -261,8 +280,8 @@ class VelocityNet(nn.Module):
     t_dim_enc : int
         Dimensionality of the raw sinusoidal time encoding before the MLP.
     use_absolute_age : bool
-        If true, include the current age alongside relative position and
-        observed age interval. Otherwise use only the latter two values.
+        If true, encode current age, relative position, and both anchor ages.
+        Otherwise encode only relative position and observed age interval.
     """
 
     def __init__(
@@ -279,7 +298,7 @@ class VelocityNet(nn.Module):
         self.t_dim = t_dim
         self.use_absolute_age = use_absolute_age
         self.encoder = EncoderUnet(
-            in_channels=1, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
+            in_channels=3, channels=[16, 32, 64, 128, 256], t_dim=self.t_dim
         )
         self.decoder_0 = UnetUpBlock(
             in_channels=256, out_channels=128, kernel_size=3, t_dim=self.t_dim
@@ -293,8 +312,11 @@ class VelocityNet(nn.Module):
         self.decoder_3 = UnetUpBlock(
             in_channels=32, out_channels=16, kernel_size=3, t_dim=self.t_dim
         )
+        if t_dim_enc < 2 or t_dim_enc % 2:
+            raise ValueError("t_dim_enc must be a positive even integer >= 2")
+        self.time_embedding = SinusoidalPositionEmbeddings(t_dim_enc)
         self.time_mlp = nn.Sequential(
-            nn.Linear(2 if use_absolute_age else 1, self.t_dim, bias=True),
+            nn.Linear((4 if use_absolute_age else 2) * t_dim_enc, self.t_dim),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -319,8 +341,8 @@ class VelocityNet(nn.Module):
     ) -> torch.Tensor:
         """Predict the velocity field at integration time *t*.
 
-        The solver integrates in the dataset's globally normalised age
-        coordinate, so ``current_age = t``. This preserves absolute age
+        The ODE reconstructs globally normalised age before calling this network,
+        so ``current_age = t`` uses the dataset's age coordinate. This preserves age
         information across subjects. Relative position ``alpha`` is zero
         at the first anchor, one at the second, and exceeds one during
         forward extrapolation. The observed interval preserves the time
@@ -348,7 +370,7 @@ class VelocityNet(nn.Module):
         v : torch.Tensor
             Predicted velocity field of shape ``(B, 3, D, H, W)``.
         """
-        net_input = torch.cat([image_t], dim=1)
+        net_input = torch.cat([image_A, image_t, image_B], dim=1)
         B: int = image_t.shape[0]
 
         if t.dim() == 0:
@@ -358,13 +380,18 @@ class VelocityNet(nn.Module):
         if ageB.dim() == 0:
             ageB = ageB.expand(B)
 
-        current_age = t  # Global age coordinate, normalized to [0, 1].
-        elapsed_time = current_age - ageA
+        current_age = t  # Globally normalised dataset age.
+        interval = ageB - ageA
+        alpha = (current_age - ageA) / interval
+
         if self.use_absolute_age:
-            temporal_inputs = torch.stack([current_age, elapsed_time], dim=1)
+            temporal_inputs = torch.stack([current_age, alpha, ageA, ageB], dim=1)
         else:
-            temporal_inputs = elapsed_time.unsqueeze(1)
-        t_all = self.time_mlp(temporal_inputs)
+            temporal_inputs = torch.stack([alpha, interval], dim=1)
+        encoded_times = self.time_embedding(
+            temporal_inputs.reshape(-1)
+        ).reshape(B, -1)
+        t_all = self.time_mlp(encoded_times)
         feat_maps = self.encoder(net_input, t_all)
         v = self.decoder_0(feat_maps[4], feat_maps[3], t_all)
         v = self.decoder_1(v, feat_maps[2], t_all)

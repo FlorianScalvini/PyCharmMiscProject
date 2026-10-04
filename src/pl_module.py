@@ -47,8 +47,10 @@ class RegistrationLongitudinal(pl.LightningModule):
         lambda_jac: float = 0.000001,
         gradient_clip_norm: float = 1.0,
         shape: list[int] = [192, 224, 192],
-        step_time: float = 0.1,
+        step_time: float | None = None,  # Legacy checkpoint argument; ignored.
         use_absolute_age: bool = True,
+        rtol: float = 1e-3,
+        atol: float = 1e-5,
         *args,
         **kwargs,
     ) -> None:
@@ -59,7 +61,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.learning_rate = learning_rate
         # Initialize the registration and segmentation networks
         self.model = LongitudinalODERegistration(
-            shape=shape, step_time=step_time, use_absolute_age=use_absolute_age
+            shape=shape, use_absolute_age=use_absolute_age, rtol=rtol, atol=atol
         )
 
         # Hyperparameters
@@ -135,7 +137,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         loss_sim = torch.tensor(0.0, device=self.device)
         loss_seg = torch.tensor(0.0, device=self.device)
         initial_img = images[0:1].float()
-        target_idx = images.shape[0] - 1
+        # Any later session can be the target anchor; supervise the full suffix,
+        # including extrapolation beyond that anchor when it is not the last.
+        target_idx = torch.randint(1, images.shape[0], ()).item()
         target_img = images[target_idx:target_idx + 1].float()
         initial_seg = None
         if has_segmentation and self.lambda_seg > 0:
@@ -179,35 +183,27 @@ class RegistrationLongitudinal(pl.LightningModule):
                 gradient_clip_val=self.gradient_clip_norm,
                 gradient_clip_algorithm="norm",
             )
+        used_lr = optimizer.param_groups[0]["lr"]
         optimizer.step() # type: ignore
+        self.lr_schedulers().step()
+        self.log("train/learning_rate", used_lr, on_step=True, on_epoch=False, batch_size=1)
 
         # One subject sequence per step; keep only the total in the progress bar.
         self.log(
             "train/loss", loss.detach(),
-            on_step=False, on_epoch=True, prog_bar=True, batch_size=1,
+            on_step=True, on_epoch=False, prog_bar=True, batch_size=1,
         )
         self.log_dict({
             "train/loss_sim": (self.lambda_sim * loss_sim).detach(),
             "train/loss_seg": (self.lambda_seg * loss_seg).detach(),
             "train/loss_reg": (self.lambda_reg * loss_reg).detach(),
             "train/loss_jac": (self.lambda_jac * loss_jac).detach(),
-        }, on_step=False, on_epoch=True, prog_bar=False, batch_size=1)
+        }, on_step=True, on_epoch=False, prog_bar=False, batch_size=1)
 
         # ── critical: free the ODE trajectory ──
         del all_phi, loss, loss_sim, loss_reg
         # ── always flush at end of step ──
         torch.cuda.empty_cache()
-
-    def on_train_epoch_end(self) -> None:
-        """Advance manual scheduling once per epoch, report LR, and save weights."""
-        used_lr = self.optimizers().param_groups[0]["lr"]
-        scheduler = self.lr_schedulers()
-        scheduler.step()
-        self.log_dict({
-            "train/learning_rate": used_lr,
-        }, on_step=False, on_epoch=True, prog_bar=False, batch_size=1)
-        torch.cuda.empty_cache()  # ← add this
-        torch.save(self.model.state_dict(), os.path.join(self.save_dir, "last_registration.pt"))
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Validation
@@ -279,6 +275,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         all_targets = []
         all_segs = []
         psnr_values = []
+        ncc_loss_values = []
 
         has_segmentation = segs.numel() > 0
         initial_seg = None
@@ -308,6 +305,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             if idx != 0:
                 mse = F.mse_loss(warped, images[idx:idx + 1].float())
                 psnr_values.append(-10 * torch.log10(mse.clamp_min(1e-10)))
+                ncc_loss_values.append(self.loss_sim(warped, images[idx:idx + 1].float()))
             if initial_seg is not None:
                 warped_seg = registration.warp_with_phi(
                     initial_seg.to(self.device).float(), phi
@@ -380,6 +378,14 @@ class RegistrationLongitudinal(pl.LightningModule):
         torch.cuda.empty_cache()
 
         if psnr_values:
+            self.log(
+                "val/loss_ncc",
+                torch.stack(ncc_loss_values).mean(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=1,
+            )
             self.log(
                 "val/psnr",
                 torch.stack(psnr_values).mean(),

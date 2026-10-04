@@ -2,7 +2,7 @@
 PyTorch Lightning data module for spatio-temporal longitudinal brain MRI.
 
 Reads train and validation subject lists from JSON manifests, normalises
-acquisition ages to the ``[0, 1]`` interval defined by ``[t0, tn]``, sorts
+acquisition ages using ``(age - t0) / (tn - t0)``, sorts
 sessions chronologically, and exposes standard Lightning DataLoader hooks.
 
 JSON manifest format
@@ -110,9 +110,9 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
     num_workers : int
         Number of DataLoader worker processes.
     t0 : float
-        Age at the start of the developmental window — maps to ``0``.
+        Age at the start of the developmental window; maps to zero.
     tn : float
-        Age at the end of the developmental window — maps to ``1``.
+        Age at the end of the developmental window; maps to one.
     size : tuple of int
         Target spatial dimensions ``(D, H, W)`` after resizing.
     crop : tuple of int
@@ -139,6 +139,8 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         augmentation: bool | tio.Transform | None = False,
     ) -> None:
         super().__init__()
+        if not tn > t0:
+            raise ValueError("age normalisation requires tn > t0")
         self.root_dir = root_dir
         if batch_size != 1:
             raise ValueError(
@@ -182,8 +184,8 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
                 subject.append(session)
 
             subject.sort(key=lambda session: session[2])
-            for j in range(len(subject)):
-                subject[j][2] = (subject[j][2] - t0) / (tn - t0)
+            for session in subject:
+                session[2] = (session[2] - t0) / (tn - t0)
             if len(subject) >= 2:
                 self.data_train.append(subject)
 
@@ -202,8 +204,8 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
                 subject.append(session)
 
             subject.sort(key=lambda session: session[2])
-            for j in range(len(subject)):
-                subject[j][2] = (subject[j][2] - t0) / (tn - t0)
+            for session in subject:
+                session[2] = (session[2] - t0) / (tn - t0)
             if len(subject) >= 2:
                 self.data_val.append(subject)
 
