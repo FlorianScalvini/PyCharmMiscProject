@@ -264,8 +264,6 @@ def main(args: Namespace) -> None:
         lambda_jac=args.lambda_jac,
         gradient_clip_norm=args.gradient_clip_norm,
         shape=config["rsize"],
-        rtol=1e-3,
-        atol=1e-5,
     )
 
     # --- Trainer ---
