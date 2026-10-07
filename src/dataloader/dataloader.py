@@ -119,6 +119,10 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         Crop/pad target ``(D, H, W)`` applied before resizing.
     merge_labels_0_1 : bool
         Merge labels 0 and 1 and shift higher labels down by one.
+    use_augmentation : bool
+        Apply one shared spatial augmentation to each training sequence:
+        left-right flip (50%), rotation up to 5 degrees, scaling up to 3%,
+        and translation up to 2 mm. Validation and testing are unaugmented.
     """
 
     def __init__(
@@ -134,6 +138,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         size: tuple[int, int, int] = (192, 224, 192),
         crop: tuple[int, int, int] = (50, 50, 50),
         merge_labels_0_1: bool = False,
+        use_augmentation: bool = False,
     ) -> None:
         super().__init__()
         self.root_dir = root_dir
@@ -150,6 +155,20 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         self.size = size
         self.crop = crop
         self.merge_labels_0_1 = merge_labels_0_1
+        self.use_augmentation = use_augmentation
+        self.augmentation = None
+        if use_augmentation:
+            self.augmentation = tio.Compose([
+                tio.RandomFlip(axes=("LR",), flip_probability=0.5),
+                tio.RandomAffine(
+                    scales=(0.97, 1.03),
+                    degrees=5,
+                    translation=2,
+                    image_interpolation="linear",
+                    label_interpolation="nearest",
+                    default_pad_value=0,
+                ),
+            ])
         self.transform = tio.transforms.Compose([
             tio.transforms.CropOrPad(crop),
             tio.transforms.Resize(size),
@@ -225,6 +244,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         dataset = SpatioTemporalDataset(
             self.data_train,
             self.transform,
+            augmentation=self.augmentation,
             merge_labels_0_1=self.merge_labels_0_1,
         )
         return torch.utils.data.DataLoader(

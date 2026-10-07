@@ -19,7 +19,11 @@ import io
 
 def compute_jacobian_determinant_3d(displacement, spacing=(1.0, 1.0, 1.0)):
     """
-    Compute the Jacobian determinant of a 3D displacement field.
+    Compute det(I + du/dvoxel) for a voxel-axis displacement field.
+
+    For the default spacing=(1, 1, 1), displacement must be in voxel units.
+    RAS-mm NIfTI exports must first be converted with the inverse affine
+    linear matrix (see flow_io.load_voxel_displacement).
 
     Parameters:
     - displacement: torch.Tensor of shape (3, D, H, W), representing the displacement field.
@@ -32,7 +36,7 @@ def compute_jacobian_determinant_3d(displacement, spacing=(1.0, 1.0, 1.0)):
 
     dz, dy, dx = spacing
     grads = []
-    for i in range(3):  # u_x, u_y, u_z
+    for i in range(3):  
         grad_i = torch.gradient(displacement[i], spacing=(dz, dy, dx), dim=(0, 1, 2))
         grads.append(grad_i)
 

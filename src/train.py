@@ -120,6 +120,12 @@ def parse_args() -> Namespace:
 
     # --- Training ---
     parser.add_argument(
+        "--use_augmentation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply shared spatial augmentation per training sequence (default: YAML use_augmentation, or false).",
+    )
+    parser.add_argument(
         "--max_epochs",
         type=int,
         default=5000,
@@ -232,6 +238,11 @@ def main(args: Namespace) -> None:
         t0=config["t0"],
         tn=config["tn"],
         merge_labels_0_1=config.get("merge_labels_0_1", False),
+        use_augmentation=(
+            args.use_augmentation
+            if args.use_augmentation is not None
+            else config.get("use_augmentation", False)
+        ),
     )
 
     # --- Model ---

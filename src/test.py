@@ -74,7 +74,8 @@ def main(args: Namespace) -> None:
     training_module: RegistrationLongitudinal = RegistrationLongitudinal(
         save_dir=save_dir,
         shape=config["rsize"],
-        step_time=0.1
+        step_time=0.1,
+        use_absolute_age=args.use_absolute_age,
     )
 
     # --- Trainer ---
@@ -106,6 +107,12 @@ if __name__ == "__main__":
         type=str,
         default="/home/florian/PyCharmMiscProject/results/dhcpatlas/train/26_07_15_55_v1/last_registration.pt",
         help="Path to the weight file for testing.",
+    )
+    parser.add_argument(
+        "--use_absolute_age",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match the absolute-age setting used to train the weights.",
     )
   
     args = parser.parse_args()

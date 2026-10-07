@@ -52,7 +52,8 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
     transform : transforms.Transform or None
         Spatial transform applied to each image volume independently.
     augmentation : transforms.Transform or None
-        Optional augmentation applied to the complete TorchIO subject.
+        Optional augmentation sampled once for all images and labels in
+        the sequence, after preprocessing. Sessions must share a grid.
     merge_labels_0_1 : bool
         Merge labels 0 and 1 and shift higher labels down by one.
     """
@@ -101,6 +102,7 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
         time_stack = []
         seg_stack = []
         data = self.data[idx]
+        sequence_images = {}
         for i in range(len(data)):
             session = tio.Subject(
                 image=tio.ScalarImage(data[i][0]),
@@ -108,15 +110,23 @@ class SpatioTemporalDataset(torch.utils.data.Dataset):
             )
             if self.transform is not None:
                 session = self.transform(session)
-            if self.augmentation is not None:
-                session = self.augmentation(session) # type: ignore
-            mri_stack.append(session.image.data)
-            labels = session.label.data
+            sequence_images[f"image_{i}"] = session.image
+            sequence_images[f"label_{i}"] = session.label
+            del session
+
+        sequence = tio.Subject(sequence_images)
+        if self.augmentation is not None:
+            # One random draw and one physical transform for the whole sequence.
+            sequence.check_consistent_space()
+            sequence = self.augmentation(sequence)
+
+        for i in range(len(data)):
+            mri_stack.append(sequence[f"image_{i}"].data)
+            labels = sequence[f"label_{i}"].data
             if self.merge_labels_0_1:
                 labels = _merge_first_two_labels(labels)
             seg_stack.append(labels)
             time_stack.append(data[i][2])
-            del session
 
         # ── 5. stack ──────────────────────────────────────────────────
         mri_stack_out = torch.stack(mri_stack, dim=0)  # (T_total, 1, X, Y, Z)
