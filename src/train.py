@@ -11,7 +11,7 @@ parameters are fully configurable via CLI flags.
 
 Usage::
 
-    python train.py --dataset data/macaque.yaml --max_epochs 5000
+    python train.py --dataset data/macaque.yaml --max_steps 5000
 
 Author : Florian Scalvini
 """
@@ -28,13 +28,28 @@ from typing import Any, Dict
 import torch
 import yaml
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # --- Local ---
 from pl_module import RegistrationLongitudinal
 from dataloader.dataloader import SpatioTemporalSequenceDatamoduleJSON
 
+
+class PeriodicRegistrationWeights(Callback):
+    """Save the latest model weights every N optimizer iterations."""
+
+    def __init__(self, every_n_steps: int, save_dir: str) -> None:
+        self.every_n_steps = every_n_steps
+        self.save_dir = save_dir
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        step = trainer.global_step
+        if trainer.is_global_zero and step > 0 and step % self.every_n_steps == 0:
+            torch.save(
+                pl_module.model.state_dict(),
+                os.path.join(self.save_dir, "last_registration.pt"),
+            )
 
 
 def parse_args() -> Namespace:
@@ -63,8 +78,8 @@ def parse_args() -> Namespace:
 
         Training
         ~~~~~~~~
-        max_epochs : int
-            Maximum number of training epochs.
+        max_steps : int
+            Maximum number of optimizer iterations.
         learning_rate : float
             Optimizer learning rate.
         lambda_seg : float
@@ -79,8 +94,8 @@ def parse_args() -> Namespace:
             Floating-point precision used during training.
         num_sanity_val_steps : int
             Number of sanity validation steps before training starts.
-        check_val_every_n_epoch : int
-            Run validation every N epochs.
+        val_every_n_steps : int
+            Run validation every N training iterations.
         checkpoint_every_n_steps : int
             Save a checkpoint every N training steps.
         gradient_clip_norm : float
@@ -126,10 +141,10 @@ def parse_args() -> Namespace:
         help="Apply shared spatial augmentation per training sequence (default: YAML use_augmentation, or false).",
     )
     parser.add_argument(
-        "--max_epochs",
+        "--max_steps",
         type=int,
         default=5000,
-        help="Maximum number of training epochs.",
+        help="Maximum number of optimizer iterations.",
     )
     parser.add_argument(
         "--learning_rate",
@@ -182,10 +197,10 @@ def parse_args() -> Namespace:
         help="Number of sanity validation steps before training starts.",
     )
     parser.add_argument(
-        "--check_val_every_n_epoch",
+        "--val_every_n_steps",
         type=int,
-        default=20,
-        help="Run validation every N epochs.",
+        default=500,
+        help="Run validation every N training iterations.",
     )
     parser.add_argument(
         "--checkpoint_every_n_steps",
@@ -194,7 +209,11 @@ def parse_args() -> Namespace:
         help="Save a checkpoint every N training steps.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    for name in ("max_steps", "val_every_n_steps", "checkpoint_every_n_steps"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name} must be positive")
+    return args
 
 
 def main(args: Namespace) -> None:
@@ -243,6 +262,11 @@ def main(args: Namespace) -> None:
             if args.use_augmentation is not None
             else config.get("use_augmentation", False)
         ),
+        augmentation=(
+            config.get("augmentation", False)
+            if args.use_augmentation is None and "use_augmentation" not in config
+            else False
+        ),
     )
 
     # --- Model ---
@@ -255,24 +279,28 @@ def main(args: Namespace) -> None:
         lambda_jac=args.lambda_jac,
         gradient_clip_norm=args.gradient_clip_norm,
         shape=config["rsize"],
-        step_time=0.05,
     )
 
     # --- Trainer ---
     trainer: pl.Trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
+        max_epochs=-1,
+        max_steps=args.max_steps,
         precision=args.precision,
         num_sanity_val_steps=args.num_sanity_val_steps,
         logger=tensorboard_logger,
         callbacks=[
+            PeriodicRegistrationWeights(args.checkpoint_every_n_steps, save_dir),
             ModelCheckpoint(
                 every_n_train_steps=args.checkpoint_every_n_steps,
                 dirpath=save_dir,
                 save_last=True,
+                save_on_train_epoch_end=False,
             ),
             TQDMProgressBar(refresh_rate=1),
         ],
-        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        check_val_every_n_epoch=None,
+        val_check_interval=args.val_every_n_steps,
+        log_every_n_steps=1,
         enable_progress_bar=True,
     )
     #training_module.model.load_state_dict(torch.load("/home/florian/PyCharmMiscProject/results/babofet/train/26_21_11_14/last_registration.pt"))

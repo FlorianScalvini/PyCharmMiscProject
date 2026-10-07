@@ -47,7 +47,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         lambda_jac: float = 0.000001,
         gradient_clip_norm: float = 1.0,
         shape: list[int] = [192, 224, 192],
-        step_time: float = 0.1,
+        step_time: float | None = None,
         use_absolute_age: bool = True,
         *args,
         **kwargs,
@@ -59,7 +59,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.learning_rate = learning_rate
         # Initialize the registration and segmentation networks
         self.model = LongitudinalODERegistration(
-            shape=shape, step_time=step_time, use_absolute_age=use_absolute_age
+            shape=shape,
+            step_time=0.05 if step_time is None else step_time,
+            use_absolute_age=use_absolute_age,
         )
 
         # Hyperparameters
@@ -123,12 +125,27 @@ class RegistrationLongitudinal(pl.LightningModule):
         images = images.squeeze(0)
         ages = ages.squeeze(0).to(self.device)
 
+        # Start from any observed time point except the last one. Slicing the
+        # three sequences together keeps images, labels and ages aligned.
+        start_idx = torch.randint(0, images.shape[0] - 1, ()).item()
+        images = images[start_idx:]
+        has_segmentation = segs.numel() > 0
+        if has_segmentation:
+            segs = segs[:, start_idx:]
+        ages = ages[start_idx:]
+
         loss_sim = torch.tensor(0.0, device=self.device)
         loss_seg = torch.tensor(0.0, device=self.device)
         initial_img = images[0:1].float()
-        target_idx = images.shape[0] - 1
+        # Any later session can be the target anchor; supervise the full suffix,
+        # including extrapolation beyond that anchor when it is not the last.
+        target_idx = torch.randint(1, images.shape[0], ()).item()
         target_img = images[target_idx:target_idx + 1].float()
-        initial_seg = F.one_hot(segs[:, 0].squeeze(0).cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3)
+        initial_seg = None
+        if has_segmentation and self.lambda_seg > 0:
+            initial_seg = F.one_hot(
+                segs[:, 0].squeeze(0).cpu().long(), num_classes=-1
+            ).permute(0, 4, 1, 2, 3)
         all_phi, loss_reg, loss_jac = self(
             initial_img, target_img, ages, ages[target_idx], grid
         )
@@ -140,7 +157,7 @@ class RegistrationLongitudinal(pl.LightningModule):
                 warped = registration.warp_with_phi(initial_img, phi)
                 loss_sim += self.loss_sim(warped, images[idx:idx + 1].float())
                 del warped
-            if self.lambda_seg > 0:
+            if initial_seg is not None:
                 warped_seg = registration.warp_with_phi(initial_seg.float().to(self.device), phi)
                 loss_seg += self.loss_seg(warped_seg[:, :], F.one_hot(segs[:, idx].squeeze(0).cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3).float().to(self.device))
                 del warped_seg
@@ -166,35 +183,27 @@ class RegistrationLongitudinal(pl.LightningModule):
                 gradient_clip_val=self.gradient_clip_norm,
                 gradient_clip_algorithm="norm",
             )
+        used_lr = optimizer.param_groups[0]["lr"]
         optimizer.step() # type: ignore
+        self.lr_schedulers().step()
+        self.log("train/learning_rate", used_lr, on_step=True, on_epoch=False, batch_size=1)
 
         # One subject sequence per step; keep only the total in the progress bar.
         self.log(
             "train/loss", loss.detach(),
-            on_step=False, on_epoch=True, prog_bar=True, batch_size=1,
+            on_step=True, on_epoch=False, prog_bar=True, batch_size=1,
         )
         self.log_dict({
             "train/loss_sim": (self.lambda_sim * loss_sim).detach(),
             "train/loss_seg": (self.lambda_seg * loss_seg).detach(),
             "train/loss_reg": (self.lambda_reg * loss_reg).detach(),
             "train/loss_jac": (self.lambda_jac * loss_jac).detach(),
-        }, on_step=False, on_epoch=True, prog_bar=False, batch_size=1)
+        }, on_step=True, on_epoch=False, prog_bar=False, batch_size=1)
 
         # ── critical: free the ODE trajectory ──
         del all_phi, loss, loss_sim, loss_reg
         # ── always flush at end of step ──
         torch.cuda.empty_cache()
-
-    def on_train_epoch_end(self) -> None:
-        """Advance manual scheduling once per epoch, report LR, and save weights."""
-        used_lr = self.optimizers().param_groups[0]["lr"]
-        scheduler = self.lr_schedulers()
-        scheduler.step()
-        self.log_dict({
-            "train/learning_rate": used_lr,
-        }, on_step=False, on_epoch=True, prog_bar=False, batch_size=1)
-        torch.cuda.empty_cache()  # ← add this
-        torch.save(self.model.state_dict(), os.path.join(self.save_dir, "last_registration.pt"))
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Validation
@@ -265,8 +274,15 @@ class RegistrationLongitudinal(pl.LightningModule):
         all_registered = []
         all_targets = []
         all_segs = []
+        psnr_values = []
+        ncc_loss_values = []
 
-        initial_seg = F.one_hot(segs[:, 0].squeeze(0).cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3)
+        has_segmentation = segs.numel() > 0
+        initial_seg = None
+        if has_segmentation:
+            initial_seg = F.one_hot(
+                segs[:, 0].squeeze(0).cpu().long(), num_classes=-1
+            ).permute(0, 4, 1, 2, 3)
         for idx in range(0, images.shape[0]):
             original_session = self.trainer.val_dataloaders.dataset.get_subject(  # type: ignore
                 batch_idx, idx
@@ -286,11 +302,20 @@ class RegistrationLongitudinal(pl.LightningModule):
             phi = all_phi[idx]
             df = registration.phi_to_displacement_voxel(phi)
             warped = registration.warp_with_phi(images[0:1].float(), phi)
-            warped_seg = registration.warp_with_phi(initial_seg.to(self.device).float(), phi)
-            warped_seg = torch.argmax(warped_seg, dim=1).detach()
-            save_label = reverse_transform(tio.LabelMap(tensor=warped_seg.int().cpu()))
-            save_label.affine = subject_original_affine
-            save_label.save(os.path.join(self.save_dir, "parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
+            if idx != 0:
+                mse = F.mse_loss(warped, images[idx:idx + 1].float())
+                psnr_values.append(-10 * torch.log10(mse.clamp_min(1e-10)))
+                ncc_loss_values.append(self.loss_sim(warped, images[idx:idx + 1].float()))
+            if initial_seg is not None:
+                warped_seg = registration.warp_with_phi(
+                    initial_seg.to(self.device).float(), phi
+                )
+                warped_seg = torch.argmax(warped_seg, dim=1).detach()
+                save_label = reverse_transform(
+                    tio.LabelMap(tensor=warped_seg.int().cpu())
+                )
+                save_label.affine = subject_original_affine
+                save_label.save(os.path.join(self.save_dir, "parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
             save_img = reverse_transform(tio.ScalarImage(tensor=warped.squeeze(0).cpu()))
             save_img.affine = subject_original_affine
             save_img.save(os.path.join(self.save_dir, "images", f"image_sample{batch_idx}_time{idx}.nii.gz"))
@@ -312,7 +337,11 @@ class RegistrationLongitudinal(pl.LightningModule):
                 ),
             )
 
-            pred_label = F.one_hot(warped_seg.cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3)
+            pred_label = None
+            if initial_seg is not None:
+                pred_label = F.one_hot(
+                    warped_seg.cpu().long(), num_classes=initial_seg.shape[1]
+                ).permute(0, 4, 1, 2, 3)
 
             all_registered.append(
                 utils.normalize_to_0_1(warped.squeeze())[:, :, shape[-1] // 2].detach().cpu().unsqueeze(0).repeat(3, 1, 1)
@@ -321,15 +350,16 @@ class RegistrationLongitudinal(pl.LightningModule):
                 utils.normalize_to_0_1(images[idx].squeeze(0))[:, :, shape[-1] // 2].detach().cpu().unsqueeze(0).repeat(3, 1,
                                                                                                                   1)
             )
-            all_segs.append(
-                utils.normalize_to_0_1(warped_seg.squeeze())[:, :, shape[-1] // 2].detach().cpu().unsqueeze(0).repeat(3, 1, 1)
-            )
+            if initial_seg is not None:
+                all_segs.append(
+                    utils.normalize_to_0_1(warped_seg.squeeze())[:, :, shape[-1] // 2].detach().cpu().unsqueeze(0).repeat(3, 1, 1)
+                )
             xy = registration.displacement2grid(df.cpu()).squeeze(0).detach()
             grid_img = visualize.plt_grid(xy[:, :, shape[-1] // 2, :].cpu())[0]
             to_tensor = transforms.ToTensor()
             grid_img = to_tensor(grid_img)  # (3, H, W)
 
-            if idx != 0:
+            if idx != 0 and pred_label is not None and initial_seg is not None:
                 self.seg_metrics(pred_label, F.one_hot(segs[:, idx].squeeze(0).cpu().long(),
                                                        num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3).cpu())
                 det_jac = utils.compute_jacobian_determinant_3d(df.cpu()).numpy()
@@ -339,11 +369,31 @@ class RegistrationLongitudinal(pl.LightningModule):
                 results = [str(batch_idx) + "_" + str(idx), dice, nb_jac_neg]
                 self.table_result_data.append(results)
 
-            del warped, warped_seg, phi, xy, pred_label
+            del warped, phi, xy
+            if initial_seg is not None:
+                del warped_seg, pred_label
             torch.cuda.empty_cache()
 
         del all_phi, df
         torch.cuda.empty_cache()
+
+        if psnr_values:
+            self.log(
+                "val/loss_ncc",
+                torch.stack(ncc_loss_values).mean(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=1,
+            )
+            self.log(
+                "val/psnr",
+                torch.stack(psnr_values).mean(),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=1,
+            )
 
         num_times = images.shape[0]
         combined = torch.stack(all_targets + all_registered + all_segs)
@@ -416,23 +466,34 @@ class RegistrationLongitudinal(pl.LightningModule):
         with torch.no_grad():
             all_phi, _, _ = self(initial_img, target_img, ages, ages[-1], grid)
         all_phi = all_phi.detach()
-        subject = self.trainer.test_dataloaders.dataset.get_subject(batch_idx) # type: ignore
+        subject = self.trainer.test_dataloaders.dataset.get_subject(batch_idx, 0) # type: ignore
         affine = subject.image.affine
         reverse_transform = tio.transforms.CropOrPad(subject.image.shape[1:])
-        initial_seg = F.one_hot(segs[:, 0].squeeze(0).cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3)
+        has_segmentation = segs.numel() > 0
+        initial_seg = None
+        if has_segmentation:
+            initial_seg = F.one_hot(
+                segs[:, 0].squeeze(0).cpu().long(), num_classes=-1
+            ).permute(0, 4, 1, 2, 3)
         for idx in range(0, images.shape[0]):
             phi = all_phi[idx]
             df = registration.phi_to_displacement_voxel(phi)
             warped = registration.warp_with_phi(images[0:1].float(), phi)
-            warped_seg = registration.warp_with_phi(initial_seg.to(self.device).float(), phi)
-            warped_seg = torch.argmax(warped_seg, dim=1).detach()
             image = reverse_transform(tio.ScalarImage(tensor=warped.cpu().squeeze(0).float()))
             image.affine = affine
             image.save(os.path.join(self.save_dir, "images", f"subject_{batch_idx}_time_{idx:03d}.nii.gz"))
 
-            parcellation = reverse_transform(tio.LabelMap(tensor=warped_seg.cpu().float()))
-            parcellation.affine = affine
-            parcellation.save(os.path.join(self.save_dir, "parcellations", f"subject_{batch_idx}_time_{idx:03d}_seg.nii.gz"))
+            warped_seg = None
+            if initial_seg is not None:
+                warped_seg = registration.warp_with_phi(
+                    initial_seg.to(self.device).float(), phi
+                )
+                warped_seg = torch.argmax(warped_seg, dim=1).detach()
+                parcellation = reverse_transform(
+                    tio.LabelMap(tensor=warped_seg.cpu().float())
+                )
+                parcellation.affine = affine
+                parcellation.save(os.path.join(self.save_dir, "parcellations", f"subject_{batch_idx}_time_{idx:03d}_seg.nii.gz"))
 
             df_image = reverse_transform(tio.ScalarImage(tensor=df.cpu().squeeze(0).float()))
             df_image.affine = affine
@@ -441,13 +502,18 @@ class RegistrationLongitudinal(pl.LightningModule):
             df_image.data = df_image.data * torch.tensor(spacing).view(1, 3, 1, 1, 1)
             df_image.save(os.path.join(self.save_dir, "flows", f"subject_{batch_idx}_time_{idx:03d}_flow.nii.gz"))
 
-            if idx != 0:
+            if idx != 0 and warped_seg is not None and initial_seg is not None:
                 pred_label = F.one_hot(warped_seg.cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3)
                 gt = F.one_hot(segs[:, idx].squeeze(0).cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3).cpu()
                 dices_subjects.append(np.mean(self.seg_metrics(pred_label, gt.cpu()).numpy()))
-            del warped, warped_seg, phi
+            del warped, phi
+            if warped_seg is not None:
+                del warped_seg
             torch.cuda.empty_cache()
-        print(f"Subject {batch_idx} : mean dice {np.mean(dices_subjects)}")
+        if dices_subjects:
+            print(f"Subject {batch_idx} : mean dice {np.mean(dices_subjects)}")
+        else:
+            print(f"Subject {batch_idx} : no segmentation available")
         del all_phi, df
         torch.cuda.empty_cache()
 
