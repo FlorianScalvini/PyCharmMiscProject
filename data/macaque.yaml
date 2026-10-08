@@ -10,4 +10,5 @@ num_classes: 11
 date_format: null
 csize: [ 128, 160, 128 ]
 rsize: [ 128, 160, 128 ]
-
+use_absolute_age: false
+use_augmentation: false

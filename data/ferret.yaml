@@ -10,7 +10,8 @@ csize: [ 128, 192, 96 ]
 rsize: [ 128, 192, 96 ]
 date_format: null
 num_classes: 15
-
+use_absolute_age: false
+use_augmentation: false
 # Legacy ferret exports: P08 labels exactly match the GT crop at [7, 17, 6],
 # while the stored affine encodes [0, 1, 6]. Shared by all methods at this crop size.
 evaluation_origin_corrections:

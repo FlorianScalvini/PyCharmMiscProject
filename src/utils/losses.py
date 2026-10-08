@@ -105,7 +105,7 @@ class NonDetJacobianPenalty(nn.Module):
         """
         det_j = utils.compute_jacobian_determinant_3d(displacement, spacing)
         epsilon = 0.05
-        temperature = 0.01
+        temperature = 0.1
         return temperature * F.softplus(
             (epsilon - det_j) / temperature
         ).mean()

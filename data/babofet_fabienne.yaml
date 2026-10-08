@@ -13,3 +13,5 @@ prediction_labels_merged: false
 date_format: null
 csize: [ 192, 224, 128 ]
 rsize: [ 192, 224, 128 ]
+use_absolute_age: false
+use_augmentation: false

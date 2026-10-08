@@ -85,6 +85,31 @@ def split_and_shuffled(
 #  Data module
 # ──────────────────────────────────────────────────────────────────────────────
 
+class EnsureTrainingShape(tio.Transform):
+    """Avoid spatial transforms for volumes already prepared at the crop/resize shape."""
+
+    def __init__(self, crop, size):
+        super().__init__(copy=False)
+        self.crop = tuple(crop)
+        self.size = tuple(size)
+        self.spatial_transform = tio.Compose([
+            tio.CropOrPad(crop),
+            tio.Resize(size),
+        ])
+
+    @property
+    def target_shape(self):
+        """Expose the crop shape used by validation to restore original space."""
+        return self.crop
+
+    def apply_transform(self, subject):
+        if self.crop == self.size and all(
+            image.spatial_shape == self.size for image in subject.get_images(intensity_only=False)
+        ):
+            return subject
+        return self.spatial_transform(subject)
+
+
 class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
     """Lightning data module for longitudinal brain MRI sequences.
 
@@ -158,7 +183,7 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
         self.size = size
         self.crop = crop
         self.merge_labels_0_1 = merge_labels_0_1
-        self.use_augmentation = use_augmentation
+        self.use_augmentation = False
         self.augmentation = augmentation
         if use_augmentation:
             self.augmentation = tio.Compose([
@@ -173,13 +198,10 @@ class SpatioTemporalSequenceDatamoduleJSON(pl.LightningDataModule):
                 ),
             ])
         self.transform = tio.transforms.Compose([
-            tio.transforms.CropOrPad(crop),
-            tio.transforms.Resize(size),
-            tio.transforms.RescaleIntensity(out_min_max=(0, 1), percentiles=(0.05, 99.5)),
+            EnsureTrainingShape(crop, size)
         ])
         self.transform_seg = tio.transforms.Compose([
-            tio.transforms.CropOrPad(crop),
-            tio.transforms.Resize(size),
+            EnsureTrainingShape(crop, size),
         ])
         self.data_train: list = []
         self.data_val: list = []

@@ -127,7 +127,7 @@ class RegistrationLongitudinal(pl.LightningModule):
 
         # Start from any observed time point except the last one. Slicing the
         # three sequences together keeps images, labels and ages aligned.
-        start_idx = torch.randint(0, images.shape[0] - 1, ()).item()
+        start_idx = 0
         images = images[start_idx:]
         has_segmentation = segs.numel() > 0
         if has_segmentation:
@@ -139,8 +139,10 @@ class RegistrationLongitudinal(pl.LightningModule):
         initial_img = images[0:1].float()
         # Any later session can be the target anchor; supervise the full suffix,
         # including extrapolation beyond that anchor when it is not the last.
-        target_idx = torch.randint(1, images.shape[0], ()).item()
-        target_img = images[target_idx:target_idx + 1].float()
+        #target_idx = torch.randint(1, images.shape[0], ()).item()
+        
+        target_idx = -1
+        target_img = images[-1:].float()
         initial_seg = None
         if has_segmentation and self.lambda_seg > 0:
             initial_seg = F.one_hot(

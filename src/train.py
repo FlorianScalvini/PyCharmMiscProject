@@ -109,7 +109,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="/home/florian/PyCharmMiscProject/data/ferret.yaml",
+        default="/home/florian/PyCharmMiscProject/data/babofet_borgne.yaml",
         help="Path to the dataset configuration file.",
     )
     parser.add_argument(
@@ -199,7 +199,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--val_every_n_steps",
         type=int,
-        default=500,
+        default=50,
         help="Run validation every N training iterations.",
     )
     parser.add_argument(
@@ -272,6 +272,7 @@ def main(args: Namespace) -> None:
     # --- Model ---
     training_module: RegistrationLongitudinal = RegistrationLongitudinal(
         learning_rate=args.learning_rate,
+        step_time=0.05,
         save_dir=save_dir,
         lambda_seg=args.lambda_seg,
         lambda_reg=args.lambda_reg,
@@ -279,6 +280,7 @@ def main(args: Namespace) -> None:
         lambda_jac=args.lambda_jac,
         gradient_clip_norm=args.gradient_clip_norm,
         shape=config["rsize"],
+        use_absolute_age=config.get("use_absolute_age", False)
     )
 
     # --- Trainer ---
