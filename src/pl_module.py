@@ -19,7 +19,6 @@ from pytorch_lightning.utilities.types import STEP_OUTPUT
 
 # --- Local ---
 import utils.utils as utils
-import utils.losses as losses
 import utils.visualize as visualize
 import utils.registration as registration
 from model.neural_ode import LongitudinalODERegistration
@@ -72,7 +71,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.gradient_clip_norm = gradient_clip_norm
         # Loss functions and metrics
         self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=21) # type: ignore
-        self.loss_reg = losses.Grad3d('l2')
         self.loss_seg = nn.MSELoss()
 
         self.seg_metrics = monai.metrics.DiceMetric() # type: ignore
@@ -442,86 +440,3 @@ class RegistrationLongitudinal(pl.LightningModule):
             torch.save(self.model.state_dict(), os.path.join(self.save_dir, "best_registration.pt"))
 
         torch.cuda.empty_cache()
-'''
-    # ──────────────────────────────────────────────────────────────────────────
-    #  Test
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def on_test_start(self) -> None:
-        """Create output directories for images, parcellations, and flow fields."""
-        # Create mri, seg and flows directories
-        os.makedirs(os.path.join(self.save_dir, "images"), exist_ok=True)
-        os.makedirs(os.path.join(self.save_dir, "parcellations"), exist_ok=True)
-        os.makedirs(os.path.join(self.save_dir, "flows"), exist_ok=True)
-
-    def test_step(self, batch: tuple, batch_idx: int) -> None:
-        """Register, warp, and save NIfTI outputs for every time-point of a test subject."""
-        images, segs, ages, = batch
-        shape = images[0].shape[2:]
-        grid = registration.generate_grid3d_tensor(shape).unsqueeze(0).to(self.device)
-        images = images.squeeze(0)
-        ages = ages.squeeze(0).to(self.device)
-        shape = images.shape[2:]
-        initial_img = images[0:1].float()
-        target_img = images[-1:].float()
-        dices_subjects = []
-        with torch.no_grad():
-            all_phi, _, _ = self(initial_img, target_img, ages, ages[-1], grid)
-        all_phi = all_phi.detach()
-        subject = self.trainer.test_dataloaders.dataset.get_subject(batch_idx, 0) # type: ignore
-        affine = subject.image.affine
-        reverse_transform = tio.transforms.CropOrPad(subject.image.shape[1:])
-        has_segmentation = segs.numel() > 0
-        initial_seg = None
-        if has_segmentation:
-            initial_seg = F.one_hot(
-                segs[:, 0].squeeze(0).cpu().long(), num_classes=-1
-            ).permute(0, 4, 1, 2, 3)
-        for idx in range(0, images.shape[0]):
-            phi = all_phi[idx]
-            df = registration.phi_to_displacement_voxel(phi)
-            warped = registration.warp_with_phi(images[0:1].float(), phi)
-            image = reverse_transform(tio.ScalarImage(tensor=warped.cpu().squeeze(0).float()))
-            image.affine = affine
-            image.save(os.path.join(self.save_dir, "images", f"subject_{batch_idx}_time_{idx:03d}.nii.gz"))
-
-            warped_seg = None
-            if initial_seg is not None:
-                warped_seg = registration.warp_with_phi(
-                    initial_seg.to(self.device).float(), phi
-                )
-                warped_seg = torch.argmax(warped_seg, dim=1).detach()
-                parcellation = reverse_transform(
-                    tio.LabelMap(tensor=warped_seg.cpu().float())
-                )
-                parcellation.affine = affine
-                parcellation.save(os.path.join(self.save_dir, "parcellations", f"subject_{batch_idx}_time_{idx:03d}_seg.nii.gz"))
-
-            df_image = reverse_transform(tio.ScalarImage(tensor=df.cpu().squeeze(0).float()))
-            df_image.affine = affine
-            spacing = subject.image.spacing
-            # Voxel to mm conversion: multiply by voxel spacing
-            df_image.data = df_image.data * torch.tensor(spacing).view(1, 3, 1, 1, 1)
-            df_image.save(os.path.join(self.save_dir, "flows", f"subject_{batch_idx}_time_{idx:03d}_flow.nii.gz"))
-
-            if idx != 0 and warped_seg is not None and initial_seg is not None:
-                pred_label = F.one_hot(warped_seg.cpu().long(), num_classes=initial_seg.shape[1]).permute(0, 4, 1, 2, 3)
-                gt = F.one_hot(segs[:, idx].squeeze(0).cpu().long(), num_classes=-1).permute(0, 4, 1, 2, 3).cpu()
-                dices_subjects.append(np.mean(self.seg_metrics(pred_label, gt.cpu()).numpy()))
-            del warped, phi
-            if warped_seg is not None:
-                del warped_seg
-            torch.cuda.empty_cache()
-        if dices_subjects:
-            print(f"Subject {batch_idx} : mean dice {np.mean(dices_subjects)}")
-        else:
-            print(f"Subject {batch_idx} : no segmentation available")
-        del all_phi, df
-        torch.cuda.empty_cache()
-
-    def on_test_epoch_end(self) -> None:
-        """Print final evaluation metrics and save the last model checkpoint."""
-        print("Test epoch ended. Computing evaluation metrics...")
-        torch.save(self.model.state_dict(), os.path.join(self.save_dir, "saved_model.pt"))
-        torch.cuda.empty_cache()
-'''

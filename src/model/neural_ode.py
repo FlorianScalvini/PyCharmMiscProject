@@ -16,7 +16,7 @@ implement a continuous-time deformable registration pipeline:
 2. **ODEFunction** – wraps :class:`VelocityNet` as the right-hand side
    ``f(t, φ_t)`` of the neural ODE ``dφ/dt = v(t, φ_t)``.  At each
    solver evaluation it also accumulates a velocity regularisation loss
-   (e.g. :class:`monai.losses.DiffusionLoss`) along the trajectory.
+   in normalised coordinates along the trajectory.
 
 3. **LongitudinalODERegistration** – the top-level ``nn.Module`` consumed
    by the Lightning training loop.  It integrates :class:`ODEFunction`
@@ -36,7 +36,6 @@ Author : Florian Scalvini
 """
 
 # --- Third-party ---
-import monai
 import torch
 from torch import nn
 from torchdiffeq import odeint_adjoint as odeint
@@ -66,9 +65,9 @@ class LongitudinalODERegistration(nn.Module):
     shape : list of int
         Spatial dimensions ``[H, W, D]`` of the input volumes.
     step_time : float
-        Fixed step size in relative anchor time (0 to 1) for RK4. Smaller values
-        increase accuracy at the cost of more :class:`VelocityNet` forward
-        passes per training step.
+        Initial step size in relative anchor time (0 to 1) for Dopri5.
+        Subsequent steps adapt to the error tolerances in both the forward
+        and adjoint solves.
     use_absolute_age : bool
         Whether to condition VelocityNet on the current absolute age.
     """
@@ -93,7 +92,7 @@ class LongitudinalODERegistration(nn.Module):
         ages: torch.Tensor,
         ages_target: torch.Tensor,
         grid: torch.Tensor,
-        loss_v: nn.Module = monai.losses.DiffusionLoss(normalize=True), # type: ignore
+        loss_v: nn.Module | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Integrate the velocity field over *ages* and return deformation trajectories.
 
@@ -111,7 +110,7 @@ class LongitudinalODERegistration(nn.Module):
             ``[-1, 1]``, used as the initial deformation state ``φ₀``.
         loss_v : nn.Module
             Velocity regularisation loss applied at each ODE evaluation
-            step (default: :class:`monai.losses.DiffusionLoss`).
+            step (default: :class:`utils.losses.NormalizedDiffusionLoss`).
 
         Returns
         -------
@@ -151,10 +150,14 @@ class LongitudinalODERegistration(nn.Module):
                 zero.clone(),
             ),  # initial state: (phi₀, loss_reg₀, loss_jac₀)
             relative_times,
-            method="rk4",
-            options={"step_size": self.step_time},
-            adjoint_method="rk4",
-            adjoint_options={"step_size": self.step_time},
+            method="dopri5",
+            rtol=1e-4,
+            atol=1e-6,
+            options={"first_step": self.step_time},
+            adjoint_method="dopri5",
+            adjoint_rtol=1e-4,
+            adjoint_atol=1e-6,
+            adjoint_options={"first_step": self.step_time},
         )
         return phi_traj, loss_reg_traj[-1], loss_jac_traj[-1]
 
@@ -197,7 +200,7 @@ class ODEFunction(nn.Module):
         ageB: torch.Tensor,
         identity_grid: torch.Tensor,
         loss_jac: nn.Module,
-        loss_v: nn.Module = monai.losses.DiffusionLoss(normalize=True), # type: ignore
+        loss_v: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.vnet = vnet
@@ -207,7 +210,7 @@ class ODEFunction(nn.Module):
         self.ageB = ageB
         self.interval = ageB - ageA
         self.identity_grid = identity_grid
-        self.loss_v = loss_v
+        self.loss_v = losses.NormalizedDiffusionLoss() if loss_v is None else loss_v
         self.loss_jac = loss_jac
 
     def forward(

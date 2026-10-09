@@ -1,9 +1,10 @@
 """
 Custom loss functions and regularisation penalties for deformable image registration.
 
-Provides four ``torch.nn.Module`` subclasses used as terms in the total
+Provides ``torch.nn.Module`` subclasses used as terms in the total
 registration loss:
 
+* :class:`NormalizedDiffusionLoss` – velocity diffusion in normalised coordinates.
 * :class:`Grad3d` – spatial smoothness regularisation on a displacement field
   via first-order finite differences (L1 or L2 penalty).
 * :class:`NonDetJacobianPenalty` – penalises folding (non-positive Jacobian
@@ -32,6 +33,25 @@ import utils.utils as utils
 # ──────────────────────────────────────────────────────────────────────────────
 #  Regularisation losses
 # ──────────────────────────────────────────────────────────────────────────────
+
+class NormalizedDiffusionLoss(nn.Module):
+    """Sum spatial derivative energies on the normalised [-1, 1]^3 domain.
+
+    Input velocities have shape (B, 3, D, H, W) and normalised units.
+    Derivative spacing follows D/H/W; vector channels are weighted equally,
+    so their order does not affect the energy. Each squared derivative is
+    averaged over batch, channels and voxels, then summed over spatial axes.
+    """
+
+    def forward(self, velocity: torch.Tensor) -> torch.Tensor:
+        if velocity.ndim != 5 or velocity.shape[1] != 3:
+            raise ValueError("velocity must have shape (B, 3, D, H, W)")
+        if any(size < 2 for size in velocity.shape[2:]):
+            raise ValueError("each spatial dimension must contain at least two voxels")
+        spacing = tuple(2.0 / (size - 1) for size in velocity.shape[2:])
+        gradients = torch.gradient(velocity, spacing=spacing, dim=(2, 3, 4))
+        return sum(gradient.square().mean() for gradient in gradients)
+
 
 class Grad3d(nn.Module):
     """Spatial smoothness regulariser based on first-order finite differences.
@@ -146,4 +166,3 @@ class LogDetJacobianPenalty(nn.Module):
         det_j = utils.compute_jacobian_determinant_3d(displacement, spacing)
         log_det_j = torch.log(torch.clamp(det_j, min=1e-6))
         return torch.sum(log_det_j)
-

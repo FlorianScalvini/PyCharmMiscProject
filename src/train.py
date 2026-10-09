@@ -109,7 +109,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="/home/florian/PyCharmMiscProject/data/babofet_borgne.yaml",
+        default="/home/florian/PyCharmMiscProject/data/ferret.yaml",
         help="Path to the dataset configuration file.",
     )
     parser.add_argument(
@@ -174,7 +174,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_reg",
         type=float,
-        default=2,
+        default=4,
         help="Weight for the regularisation loss term.",
     )
     parser.add_argument(
@@ -224,6 +224,7 @@ def main(args: Namespace) -> None:
     args : Namespace
         Parsed command-line arguments returned by :func:`parse_args`.
     """
+    pl.seed_everything(42, workers=True)
     gc.collect()
     torch.cuda.empty_cache()
     torch.set_float32_matmul_precision("high")
