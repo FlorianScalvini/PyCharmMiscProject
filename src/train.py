@@ -132,6 +132,12 @@ def parse_args() -> Namespace:
         default=8,
         help="Number of DataLoader worker processes.",
     )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=1,
+        help="Number of devices used by Lightning (use 4 for one four-GPU DDP job).",
+    )
 
     # --- Training ---
     parser.add_argument(
@@ -139,6 +145,12 @@ def parse_args() -> Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Apply shared spatial augmentation per training sequence (default: YAML use_augmentation, or false).",
+    )
+    parser.add_argument(
+        "--random_target",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Sample the target session from indices 1..N-1 each step (default: always use the final session).",
     )
     parser.add_argument(
         "--max_steps",
@@ -174,7 +186,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_reg",
         type=float,
-        default=4,
+        default=0.0004,
         help="Weight for the regularisation loss term.",
     )
     parser.add_argument(
@@ -210,7 +222,7 @@ def parse_args() -> Namespace:
     )
 
     args = parser.parse_args()
-    for name in ("max_steps", "val_every_n_steps", "checkpoint_every_n_steps"):
+    for name in ("devices", "max_steps", "val_every_n_steps", "checkpoint_every_n_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
     return args
@@ -233,9 +245,14 @@ def main(args: Namespace) -> None:
         config: Dict[str, Any] = yaml.safe_load(f)
 
     # --- Output directory ---
-    dir_name: str = datetime.now().strftime("%y_%m_%d_%H_%M_%S")
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    dir_name: str = (
+        f"slurm_{slurm_job_id}"
+        if slurm_job_id is not None
+        else datetime.now().strftime("%y_%m_%d_%H_%M_%S")
+    )
     save_dir: str = os.path.join("./", "results", config["name"], "train", dir_name)
-    if os.path.exists(save_dir):
+    if slurm_job_id is None and os.path.exists(save_dir):
         # create versioned directory if the base directory already exists
         version: int = 1
         while os.path.exists(f"{save_dir}_v{version}"):
@@ -244,7 +261,7 @@ def main(args: Namespace) -> None:
     os.makedirs(save_dir, exist_ok=True)
 
     # --- Logger ---
-    tensorboard_logger: TensorBoardLogger = TensorBoardLogger(save_dir=save_dir)
+    tensorboard_logger: TensorBoardLogger = TensorBoardLogger(save_dir=save_dir, version=0)
 
     # --- Data module ---
     datamodule: pl.LightningDataModule = SpatioTemporalSequenceDatamoduleJSON(
@@ -281,11 +298,15 @@ def main(args: Namespace) -> None:
         lambda_jac=args.lambda_jac,
         gradient_clip_norm=args.gradient_clip_norm,
         shape=config["rsize"],
-        use_absolute_age=config.get("use_absolute_age", False)
+        use_absolute_age=config.get("use_absolute_age", False),
+        random_target=args.random_target,
     )
 
     # --- Trainer ---
     trainer: pl.Trainer = pl.Trainer(
+        accelerator="auto",
+        devices=args.devices,
+        strategy="ddp" if args.devices > 1 else "auto",
         max_epochs=-1,
         max_steps=args.max_steps,
         precision=args.precision,

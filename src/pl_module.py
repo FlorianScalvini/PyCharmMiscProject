@@ -48,6 +48,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         shape: list[int] = [192, 224, 192],
         step_time: float | None = None,
         use_absolute_age: bool = True,
+        random_target: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -69,11 +70,12 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.lambda_seg = lambda_seg
         self.lambda_jac = lambda_jac
         self.gradient_clip_norm = gradient_clip_norm
+        self.random_target = random_target
         # Loss functions and metrics
         self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=21) # type: ignore
         self.loss_seg = nn.MSELoss()
 
-        self.seg_metrics = monai.metrics.DiceMetric() # type: ignore
+        self.seg_metrics = monai.metrics.DiceMetric(ignore_empty=True) # type: ignore
 
         # Logging and tracking best performance
         self.save_dir = save_dir
@@ -135,12 +137,14 @@ class RegistrationLongitudinal(pl.LightningModule):
         loss_sim = torch.tensor(0.0, device=self.device)
         loss_seg = torch.tensor(0.0, device=self.device)
         initial_img = images[0:1].float()
-        # Any later session can be the target anchor; supervise the full suffix,
-        # including extrapolation beyond that anchor when it is not the last.
-        #target_idx = torch.randint(1, images.shape[0], ()).item()
-        
-        target_idx = -1
-        target_img = images[-1:].float()
+        # Optionally sample any later session as the target anchor while still
+        # supervising the full trajectory, including extrapolated sessions.
+        target_idx = (
+            int(torch.randint(1, images.shape[0], ()).item())
+            if self.random_target
+            else images.shape[0] - 1
+        )
+        target_img = images[target_idx:target_idx + 1].float()
         initial_seg = None
         if has_segmentation and self.lambda_seg > 0:
             initial_seg = F.one_hot(
@@ -276,6 +280,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         all_segs = []
         psnr_values = []
         ncc_loss_values = []
+        save_validation_outputs = getattr(self.trainer, "world_size", 1) == 1
 
         has_segmentation = segs.numel() > 0
         initial_seg = None
@@ -284,21 +289,22 @@ class RegistrationLongitudinal(pl.LightningModule):
                 segs[:, 0].squeeze(0).cpu().long(), num_classes=-1
             ).permute(0, 4, 1, 2, 3)
         for idx in range(0, images.shape[0]):
-            original_session = self.trainer.val_dataloaders.dataset.get_subject(  # type: ignore
-                batch_idx, idx
-            )
-            subject_original_affine = original_session.image.affine
-            original_shape = tuple(original_session.image.spatial_shape)
-            crop_shape = tuple(
-                self.trainer.val_dataloaders.dataset.transform.transforms[0].target_shape  # type: ignore
-            )
-            reverse_transform = self._validation_reverse_transform(
-                tuple(shape), crop_shape, original_shape
-            )
-            processed_session = self.trainer.val_dataloaders.dataset.transform(  # type: ignore
-                original_session
-            )
-            model_affine = processed_session.image.affine
+            if save_validation_outputs:
+                original_session = self.trainer.val_dataloaders.dataset.get_subject(  # type: ignore
+                    batch_idx, idx
+                )
+                subject_original_affine = original_session.image.affine
+                original_shape = tuple(original_session.image.spatial_shape)
+                crop_shape = tuple(
+                    self.trainer.val_dataloaders.dataset.transform.transforms[0].target_shape  # type: ignore
+                )
+                reverse_transform = self._validation_reverse_transform(
+                    tuple(shape), crop_shape, original_shape
+                )
+                processed_session = self.trainer.val_dataloaders.dataset.transform(  # type: ignore
+                    original_session
+                )
+                model_affine = processed_session.image.affine
             phi = all_phi[idx]
             df = registration.phi_to_displacement_voxel(phi)
             warped = registration.warp_with_phi(images[0:1].float(), phi)
@@ -311,31 +317,33 @@ class RegistrationLongitudinal(pl.LightningModule):
                     initial_seg.to(self.device).float(), phi
                 )
                 warped_seg = torch.argmax(warped_seg, dim=1).detach()
-                save_label = reverse_transform(
-                    tio.LabelMap(tensor=warped_seg.int().cpu())
-                )
-                save_label.affine = subject_original_affine
-                save_label.save(os.path.join(self.save_dir, "parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
-            save_img = reverse_transform(tio.ScalarImage(tensor=warped.squeeze(0).cpu()))
-            save_img.affine = subject_original_affine
-            save_img.save(os.path.join(self.save_dir, "images", f"image_sample{batch_idx}_time{idx}.nii.gz"))
+                if save_validation_outputs:
+                    save_label = reverse_transform(
+                        tio.LabelMap(tensor=warped_seg.int().cpu())
+                    )
+                    save_label.affine = subject_original_affine
+                    save_label.save(os.path.join(self.save_dir, "parcellations", f"segmentation_sample{batch_idx}_time{idx}.nii.gz"))
+            if save_validation_outputs:
+                save_img = reverse_transform(tio.ScalarImage(tensor=warped.squeeze(0).cpu()))
+                save_img.affine = subject_original_affine
+                save_img.save(os.path.join(self.save_dir, "images", f"image_sample{batch_idx}_time{idx}.nii.gz"))
 
-            # Save the exact model-grid displacement displayed in TensorBoard.
-            # MONAI channels are dI,dJ,dK; ITK-SNAP needs physical RAS vectors.
-            flow_ijk = df.squeeze(0).cpu()
-            model_linear = torch.as_tensor(
-                model_affine[:3, :3], dtype=flow_ijk.dtype
-            )
-            flow_ras_mm = torch.einsum("rc,cijk->rijk", model_linear, flow_ijk)
-            self._save_displacement_nifti(
-                flow_ras_mm,
-                model_affine,
-                os.path.join(
-                    self.save_dir,
-                    "flows",
-                    f"df_sample{batch_idx}_time{idx}.nii.gz",
-                ),
-            )
+                # Save the exact model-grid displacement displayed in TensorBoard.
+                # MONAI channels are dI,dJ,dK; ITK-SNAP needs physical RAS vectors.
+                flow_ijk = df.squeeze(0).cpu()
+                model_linear = torch.as_tensor(
+                    model_affine[:3, :3], dtype=flow_ijk.dtype
+                )
+                flow_ras_mm = torch.einsum("rc,cijk->rijk", model_linear, flow_ijk)
+                self._save_displacement_nifti(
+                    flow_ras_mm,
+                    model_affine,
+                    os.path.join(
+                        self.save_dir,
+                        "flows",
+                        f"df_sample{batch_idx}_time{idx}.nii.gz",
+                    ),
+                )
 
             pred_label = None
             if initial_seg is not None:
@@ -365,7 +373,7 @@ class RegistrationLongitudinal(pl.LightningModule):
                 det_jac = utils.compute_jacobian_determinant_3d(df.cpu()).numpy()
                 nb_jac_neg = float(np.sum(det_jac <= 0))
                 buffer = self.seg_metrics.get_buffer()
-                dice = float(buffer[-1].mean().item())
+                dice = float(torch.nanmean(buffer[-1]).item())
                 results = [str(batch_idx) + "_" + str(idx), dice, nb_jac_neg]
                 self.table_result_data.append(results)
 
@@ -385,6 +393,7 @@ class RegistrationLongitudinal(pl.LightningModule):
                 on_epoch=True,
                 prog_bar=True,
                 batch_size=1,
+                sync_dist=True,
             )
             self.log(
                 "val/psnr",
@@ -393,21 +402,23 @@ class RegistrationLongitudinal(pl.LightningModule):
                 on_epoch=True,
                 prog_bar=True,
                 batch_size=1,
+                sync_dist=True,
             )
 
         num_times = images.shape[0]
         combined = torch.stack(all_targets + all_registered + all_segs)
         grid_visualization = make_grid(combined, nrow=num_times, padding=5, pad_value=1.0)
-        self.logger.experiment.add_image(  # type: ignore
-            f"val/images/sequence_{batch_idx:03d}",
-            grid_visualization,
-            global_step=self.global_step,
-        )
+        if getattr(self.trainer, "is_global_zero", True):
+            self.logger.experiment.add_image(  # type: ignore
+                f"val/images/sequence_{batch_idx:03d}",
+                grid_visualization,
+                global_step=self.global_step,
+            )
         del combined, grid_visualization
 
     def on_validation_epoch_end(self) -> None:
         """Log aggregated metrics and grid images; save model if a new Dice best is reached."""
-        if self.trainer.sanity_checking or not self.table_result_data:
+        if self.trainer.sanity_checking:
             self.table_result_data = []
             self.seg_metrics.reset()
             return
@@ -417,17 +428,31 @@ class RegistrationLongitudinal(pl.LightningModule):
         dice_vals = [row[1] for row in self.table_result_data]
         jac_vals = [row[2] for row in self.table_result_data]
 
-        # Log per-sample scalars
-        for row in self.table_result_data:
-            sample_id, dice, nb_jac_neg = row
-            self.logger.experiment.add_scalar(f"val/samples/{sample_id}/dice", dice, global_step=step) # type: ignore
-            self.logger.experiment.add_scalar(f"val/samples/{sample_id}/jac_neg_count", float(nb_jac_neg), global_step=step) # type: ignore
+        metric_totals = torch.tensor(
+            [sum(dice_vals), sum(jac_vals), len(dice_vals)],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(metric_totals)
+        if metric_totals[2].item() == 0:
+            self.table_result_data = []
+            self.seg_metrics.reset()
+            return
+        mean_dice = float((metric_totals[0] / metric_totals[2]).item())
+        mean_jac = float((metric_totals[1] / metric_totals[2]).item())
 
-        mean_dice = float(np.mean(dice_vals))
+        # Log per-sample scalars
+        if getattr(self.trainer, "is_global_zero", True):
+            for row in self.table_result_data:
+                sample_id, dice, nb_jac_neg = row
+                self.logger.experiment.add_scalar(f"val/samples/{sample_id}/dice", dice, global_step=step) # type: ignore
+                self.logger.experiment.add_scalar(f"val/samples/{sample_id}/jac_neg_count", float(nb_jac_neg), global_step=step) # type: ignore
+
         # Lightning writes each aggregate once, on the same global-step axis.
         self.log("val/dice", mean_dice, on_step=False, on_epoch=True, prog_bar=True)
         self.log(
-            "val/jac_neg_count", float(np.mean(jac_vals)),
+            "val/jac_neg_count", mean_jac,
             on_step=False, on_epoch=True, prog_bar=True,
         )
 
@@ -437,6 +462,7 @@ class RegistrationLongitudinal(pl.LightningModule):
 
         if self.max_dice_score < mean_dice:
             self.max_dice_score = mean_dice
-            torch.save(self.model.state_dict(), os.path.join(self.save_dir, "best_registration.pt"))
+            if getattr(self.trainer, "is_global_zero", True):
+                torch.save(self.model.state_dict(), os.path.join(self.save_dir, "best_registration.pt"))
 
         torch.cuda.empty_cache()
