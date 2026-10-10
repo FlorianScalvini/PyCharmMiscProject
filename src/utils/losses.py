@@ -7,8 +7,8 @@ registration loss:
 * :class:`NormalizedDiffusionLoss` – velocity diffusion in normalised coordinates.
 * :class:`Grad3d` – spatial smoothness regularisation on a displacement field
   via first-order finite differences (L1 or L2 penalty).
-* :class:`NonDetJacobianPenalty` – penalises folding (non-positive Jacobian
-  determinants) by summing the negative part of ``det(J)``.
+* :class:`NonDetJacobianPenalty` – penalises Jacobian determinants below a
+  positive safety margin with a mean Smooth L1 penalty.
 * :class:`LogDetJacobianPenalty` – encourages volume-preserving deformations
   by penalising the log of the Jacobian determinant.
 * :class:`CorticalMeanCurvatureLoss` – drives the cortical plication by
@@ -96,11 +96,12 @@ class Grad3d(nn.Module):
 
 
 class NonDetJacobianPenalty(nn.Module):
-    """Smooth barrier on small Jacobian determinants (folding prevention).
+    """Smooth L1 penalty on Jacobian determinants below a positive margin.
 
-    Uses a temperature-scaled softplus approximation of
-    ``relu(epsilon - det(J))``.  This penalises folds and creates a small
-    positive safety margin before the determinant reaches zero.
+    Apply Smooth L1 with beta=0.1 to ``relu(0.05 - det(J))``. The penalty
+    and its determinant derivative are zero at and above the margin. Below
+    it, the slope increases continuously in magnitude before saturating at
+    one. This encourages folding prevention without guaranteeing it.
     """
 
     def __init__(self) -> None:
@@ -111,7 +112,7 @@ class NonDetJacobianPenalty(nn.Module):
         displacement: torch.Tensor,
         spacing: Sequence[float] = (1.0, 1.0, 1.0),
     ) -> torch.Tensor:
-        """Compute the non-positive Jacobian penalty for a displacement field.
+        """Compute the below-margin Jacobian penalty for a displacement field.
 
         Args:
             displacement: Displacement field of shape ``(B, 3, D, H, W)``
@@ -121,14 +122,15 @@ class NonDetJacobianPenalty(nn.Module):
                      Defaults to ``(1.0, 1.0, 1.0)``.
 
         Returns:
-            Scalar tensor — mean smooth barrier over all voxels.
+            Scalar tensor — mean Smooth L1 margin penalty over all voxels.
         """
         det_j = utils.compute_jacobian_determinant_3d(displacement, spacing)
         epsilon = 0.05
-        temperature = 0.1
-        return temperature * F.softplus(
-            (epsilon - det_j) / temperature
-        ).mean()
+        delta = 0.1
+        violation = F.relu(epsilon - det_j)
+        return F.smooth_l1_loss(
+            violation, torch.zeros_like(violation), beta=delta, reduction="mean"
+        )
 
 
 class LogDetJacobianPenalty(nn.Module):

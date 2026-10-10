@@ -44,7 +44,12 @@ def compute_jacobian_determinant_3d(displacement, spacing=(1.0, 1.0, 1.0)):
     # Add identity to convert ∂φ/∂x = I + ∂u/∂x
     identity = torch.eye(3).to(displacement.device)
     jacobian = jacobian + identity
-    det_j = torch.linalg.det(jacobian)
+    # Explicit 3x3 determinant keeps cofactor gradients at singular matrices.
+    # In particular, collapsing one axis must still receive a folding gradient.
+    a, b, c = jacobian[..., 0, :].unbind(-1)
+    d, e, f = jacobian[..., 1, :].unbind(-1)
+    g, h, i = jacobian[..., 2, :].unbind(-1)
+    det_j = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
     return det_j.unsqueeze(0)
 
 
