@@ -22,6 +22,9 @@ import utils.utils as utils
 import utils.visualize as visualize
 import utils.registration as registration
 from model.neural_ode import LongitudinalODERegistration
+from utils.training_diagnostics import (
+    component_gradient_metrics, deformation_metrics, tensor_norm,
+)
 
 
 class RegistrationLongitudinal(pl.LightningModule):
@@ -49,6 +52,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         step_time: float | None = None,
         use_absolute_age: bool = True,
         random_target: bool = False,
+        diagnostic_every_n_steps: int = 50,
         *args,
         **kwargs,
     ) -> None:
@@ -71,6 +75,9 @@ class RegistrationLongitudinal(pl.LightningModule):
         self.lambda_jac = lambda_jac
         self.gradient_clip_norm = gradient_clip_norm
         self.random_target = random_target
+        if diagnostic_every_n_steps < 0:
+            raise ValueError("diagnostic_every_n_steps must be nonnegative")
+        self.diagnostic_every_n_steps = diagnostic_every_n_steps
         # Loss functions and metrics
         self.loss_sim = monai.losses.LocalNormalizedCrossCorrelationLoss(kernel_size=21) # type: ignore
         self.loss_seg = nn.MSELoss()
@@ -179,17 +186,69 @@ class RegistrationLongitudinal(pl.LightningModule):
             + self.lambda_reg * loss_reg
             + self.lambda_jac * loss_jac
         )
+        parameters = tuple(p for p in self.model.parameters() if p.requires_grad)
+        diagnostics = {}
+        interval = self.diagnostic_every_n_steps
+        if interval > 0 and self.global_step % interval == 0:
+            trainer = getattr(self, "_trainer", None)
+            single_device = trainer is None or trainer.world_size == 1
+            diagnostics["component_gradients_enabled"] = float(single_device)
+            if single_device:
+                diagnostics.update(component_gradient_metrics({
+                    "seg": self.lambda_seg * loss_seg,
+                    "sim": self.lambda_sim * loss_sim,
+                    "reg": self.lambda_reg * loss_reg,
+                    "jac": self.lambda_jac * loss_jac,
+                }, parameters))
+            diagnostics.update(deformation_metrics(all_phi.detach(), grid))
         optimizer.zero_grad() # type: ignore
+        solver_stats = getattr(self.model, "solver_stats", None)
+        nfe_before_backward = solver_stats["nfe"] if solver_stats is not None else 0
         self.manual_backward(loss)
+        if solver_stats is not None:
+            diagnostics.update({
+                "ode_forward_nfe": solver_stats["forward_nfe"],
+                "ode_backward_nfe": solver_stats["nfe"] - nfe_before_backward,
+                "ode_diagnostic_nfe": nfe_before_backward - solver_stats["forward_nfe"],
+            })
+        # In manual AMP optimization, Lightning unscales at optimizer.step(),
+        # after this clipping call. Clip in scaled units and report true norms.
+        trainer = getattr(self, "_trainer", None)
+        scaler = getattr(getattr(trainer, "precision_plugin", None), "scaler", None)
+        scale = float(scaler.get_scale()) if scaler is not None else 1.0
+        pre_clip = tensor_norm((p.grad for p in parameters), loss) / scale
         if self.gradient_clip_norm > 0:
             self.clip_gradients(
                 optimizer,
-                gradient_clip_val=self.gradient_clip_norm,
+                gradient_clip_val=self.gradient_clip_norm * scale,
                 gradient_clip_algorithm="norm",
             )
+        post_clip = tensor_norm((p.grad for p in parameters), loss) / scale
+        diagnostics.update({
+            "sequence_length": ages.numel(),
+            "age_start": ages[0].detach(),
+            "age_end": ages[-1].detach(),
+            "age_target": ages[target_idx].detach(),
+            "integration_duration": integration_duration.detach(),
+            "grad_norm_pre_clip": pre_clip,
+            "grad_norm_post_clip": post_clip,
+            "grad_finite": torch.isfinite(pre_clip).float(),
+            "grad_clip_active": (
+                (pre_clip > self.gradient_clip_norm).float()
+                if self.gradient_clip_norm > 0 else loss.new_zeros(())
+            ),
+        })
         used_lr = optimizer.param_groups[0]["lr"]
+        before_update = [p.detach().clone() for p in parameters]
         optimizer.step() # type: ignore
+        diagnostics["parameter_update_norm"] = tensor_norm(
+            (p.detach() - before for p, before in zip(parameters, before_update)), loss
+        )
+        del before_update
         self.lr_schedulers().step()
+        self.log_dict({
+            f"train/diagnostics/{name}": value for name, value in diagnostics.items()
+        }, on_step=True, on_epoch=False, prog_bar=False, batch_size=1)
         self.log("train/learning_rate", used_lr, on_step=True, on_epoch=False, batch_size=1)
 
         # One subject sequence per step; keep only the total in the progress bar.

@@ -176,6 +176,10 @@ def parse_args() -> Namespace:
         default=1.0,
         help="Weight for the segmentation loss term.",
     )
+    parser.add_argument(
+        "--diagnostic_every_n_steps", type=int, default=50,
+        help="Sample per-loss gradients and deformation metrics every N updates; 0 disables sampling. Per-loss parameter gradients are single-device only.",
+    )
 
     parser.add_argument(
         "--lambda_sim",
@@ -222,6 +226,8 @@ def parse_args() -> Namespace:
     )
 
     args = parser.parse_args()
+    if args.diagnostic_every_n_steps < 0:
+        parser.error("--diagnostic_every_n_steps must be nonnegative")
     for name in ("devices", "max_steps", "val_every_n_steps", "checkpoint_every_n_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
@@ -300,6 +306,7 @@ def main(args: Namespace) -> None:
         shape=config["rsize"],
         use_absolute_age=config.get("use_absolute_age", False),
         random_target=args.random_target,
+        diagnostic_every_n_steps=args.diagnostic_every_n_steps,
     )
 
     # --- Trainer ---
