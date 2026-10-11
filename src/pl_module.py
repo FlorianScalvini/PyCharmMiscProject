@@ -23,7 +23,7 @@ import utils.visualize as visualize
 import utils.registration as registration
 from model.neural_ode import LongitudinalODERegistration
 from utils.training_diagnostics import (
-    component_gradient_metrics, deformation_metrics, tensor_norm,
+    component_gradient_metrics, deformation_metrics, optimizer_step_metrics, tensor_norm,
 )
 
 
@@ -117,8 +117,8 @@ class RegistrationLongitudinal(pl.LightningModule):
 
     def configure_optimizers(self) -> tuple[list, list]:
         """Return Adam with exponential learning-rate decay."""
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, amsgrad=True)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
         return [optimizer], [scheduler]
 
     def training_step(self, batch: tuple, _) -> None:
@@ -241,9 +241,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         used_lr = optimizer.param_groups[0]["lr"]
         before_update = [p.detach().clone() for p in parameters]
         optimizer.step() # type: ignore
-        diagnostics["parameter_update_norm"] = tensor_norm(
-            (p.detach() - before for p, before in zip(parameters, before_update)), loss
-        )
+        diagnostics.update(optimizer_step_metrics(optimizer, parameters, before_update, loss))
         del before_update
         self.lr_schedulers().step()
         self.log_dict({
