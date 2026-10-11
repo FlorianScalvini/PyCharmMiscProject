@@ -139,9 +139,9 @@ class LongitudinalODERegistration(nn.Module):
         # Only deformation coordinates participate in adaptive error control.
         phi_traj = odeint(
             ode_func, grid, relative_times,
-            method="dopri5", rtol=1e-7, atol=1e-9,
+            method="dopri5", rtol=1e-4, atol=1e-6,
             options={"first_step": self.step_time},
-            adjoint_method="dopri5", adjoint_rtol=1e-7, adjoint_atol=1e-9,
+            adjoint_method="dopri5", adjoint_rtol=1e-4, adjoint_atol=1e-6,
             adjoint_options={"first_step": self.step_time},
         )
         # Keep a plain counter dictionary, without registering another copy of
