@@ -161,13 +161,13 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.001,
+        default=0.0005,
         help="Optimizer learning rate.",
     )
     parser.add_argument(
         "--gradient_clip_norm",
         type=float,
-        default=1.0,
+        default=.5,
         help="Maximum gradient norm (0 disables clipping).",
     )
     parser.add_argument(

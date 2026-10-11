@@ -4,11 +4,10 @@ Custom loss functions and regularisation penalties for deformable image registra
 Provides ``torch.nn.Module`` subclasses used as terms in the total
 registration loss:
 
-* :class:`NormalizedDiffusionLoss` – velocity diffusion in normalised coordinates.
 * :class:`Grad3d` – spatial smoothness regularisation on a displacement field
   via first-order finite differences (L1 or L2 penalty).
 * :class:`NonDetJacobianPenalty` – penalises Jacobian determinants below a
-  positive safety margin with a mean Smooth L1 penalty.
+  positive safety margin with a mean temperature-scaled softplus barrier.
 * :class:`LogDetJacobianPenalty` – encourages volume-preserving deformations
   by penalising the log of the Jacobian determinant.
 * :class:`CorticalMeanCurvatureLoss` – drives the cortical plication by
@@ -33,25 +32,6 @@ import utils.utils as utils
 # ──────────────────────────────────────────────────────────────────────────────
 #  Regularisation losses
 # ──────────────────────────────────────────────────────────────────────────────
-
-class NormalizedDiffusionLoss(nn.Module):
-    """Sum spatial derivative energies on the normalised [-1, 1]^3 domain.
-
-    Input velocities have shape (B, 3, D, H, W) and normalised units.
-    Derivative spacing follows D/H/W; vector channels are weighted equally,
-    so their order does not affect the energy. Each squared derivative is
-    averaged over batch, channels and voxels, then summed over spatial axes.
-    """
-
-    def forward(self, velocity: torch.Tensor) -> torch.Tensor:
-        if velocity.ndim != 5 or velocity.shape[1] != 3:
-            raise ValueError("velocity must have shape (B, 3, D, H, W)")
-        if any(size < 2 for size in velocity.shape[2:]):
-            raise ValueError("each spatial dimension must contain at least two voxels")
-        spacing = tuple(2.0 / (size - 1) for size in velocity.shape[2:])
-        gradients = torch.gradient(velocity, spacing=spacing, dim=(2, 3, 4))
-        return sum(gradient.square().mean() for gradient in gradients)
-
 
 class Grad3d(nn.Module):
     """Spatial smoothness regulariser based on first-order finite differences.
@@ -96,12 +76,11 @@ class Grad3d(nn.Module):
 
 
 class NonDetJacobianPenalty(nn.Module):
-    """Smooth L1 penalty on Jacobian determinants below a positive margin.
+    """Smooth barrier on small Jacobian determinants (folding prevention).
 
-    Apply Smooth L1 with beta=0.1 to ``relu(0.05 - det(J))``. The penalty
-    and its determinant derivative are zero at and above the margin. Below
-    it, the slope increases continuously in magnitude before saturating at
-    one. This encourages folding prevention without guaranteeing it.
+    Uses a temperature-scaled softplus approximation of
+    ``relu(epsilon - det(J))``.  This penalises folds and creates a small
+    positive safety margin before the determinant reaches zero.
     """
 
     def __init__(self) -> None:
@@ -112,7 +91,7 @@ class NonDetJacobianPenalty(nn.Module):
         displacement: torch.Tensor,
         spacing: Sequence[float] = (1.0, 1.0, 1.0),
     ) -> torch.Tensor:
-        """Compute the below-margin Jacobian penalty for a displacement field.
+        """Compute the non-positive Jacobian penalty for a displacement field.
 
         Args:
             displacement: Displacement field of shape ``(B, 3, D, H, W)``
@@ -122,15 +101,14 @@ class NonDetJacobianPenalty(nn.Module):
                      Defaults to ``(1.0, 1.0, 1.0)``.
 
         Returns:
-            Scalar tensor — mean Smooth L1 margin penalty over all voxels.
+            Scalar tensor — mean smooth barrier over all voxels.
         """
         det_j = utils.compute_jacobian_determinant_3d(displacement, spacing)
         epsilon = 0.05
-        delta = 0.1
-        violation = F.relu(epsilon - det_j)
-        return F.smooth_l1_loss(
-            violation, torch.zeros_like(violation), beta=delta, reduction="mean"
-        )
+        temperature = 0.05
+        return temperature * F.softplus(
+            (epsilon - det_j) / temperature
+        ).mean()
 
 
 class LogDetJacobianPenalty(nn.Module):

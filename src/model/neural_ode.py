@@ -36,6 +36,7 @@ Author : Florian Scalvini
 """
 
 # --- Third-party ---
+import monai
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -81,7 +82,7 @@ class LongitudinalODERegistration(nn.Module):
         super().__init__()
         self.velocity_net = VelocityNet(shape=shape, use_absolute_age=use_absolute_age)
         self.jacobian_loss = losses.NonDetJacobianPenalty()
-        self.velocity_loss = losses.NormalizedDiffusionLoss()
+        self.velocity_loss = monai.losses.DiffusionLoss(normalize=True)
         if step_time <= 0:
             raise ValueError("step_time must be positive")
         self.step_time = step_time
@@ -111,7 +112,7 @@ class LongitudinalODERegistration(nn.Module):
             ``[-1, 1]``, used as the initial deformation state ``φ₀``.
         loss_v : nn.Module
             Velocity penalty evaluated at acquisition times outside the ODE
-            (default: :class:`utils.losses.NormalizedDiffusionLoss`).
+            (default: :class:`monai.losses.DiffusionLoss` with normalize=True).
 
         Returns
         -------
@@ -138,9 +139,9 @@ class LongitudinalODERegistration(nn.Module):
         # Only deformation coordinates participate in adaptive error control.
         phi_traj = odeint(
             ode_func, grid, relative_times,
-            method="dopri5", rtol=1e-4, atol=1e-6,
+            method="dopri5", rtol=1e-7, atol=1e-9,
             options={"first_step": self.step_time},
-            adjoint_method="dopri5", adjoint_rtol=1e-4, adjoint_atol=1e-6,
+            adjoint_method="dopri5", adjoint_rtol=1e-7, adjoint_atol=1e-9,
             adjoint_options={"first_step": self.step_time},
         )
         # Keep a plain counter dictionary, without registering another copy of
