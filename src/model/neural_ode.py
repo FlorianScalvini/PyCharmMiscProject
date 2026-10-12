@@ -20,7 +20,7 @@ implement a continuous-time deformable registration pipeline:
 
 3. **LongitudinalODERegistration** – the top-level ``nn.Module`` consumed
    by the Lightning training loop.  It integrates :class:`ODEFunction`
-   from *ages[0]* to *ages[-1]* using the adaptive Dopri5 solver from
+   from *ages[0]* to *ages[-1]* using the fixed-step RK4 solver from
    `torchdiffeq <https://github.com/rtqichen/torchdiffeq>`_ and returns
    the full deformation trajectory (one field per acquisition age) together
    with external trapezoidal regularisation integrals.
@@ -66,9 +66,8 @@ class LongitudinalODERegistration(nn.Module):
     shape : list of int
         Spatial dimensions ``[H, W, D]`` of the input volumes.
     step_time : float
-        Initial step size in relative anchor time (0 to 1) for Dopri5.
-        Subsequent steps adapt to the error tolerances in both the forward
-        and adjoint solves.
+        Fixed RK4 step size in relative anchor time (0 to 1), used for both
+        the forward and adjoint solves.
     use_absolute_age : bool
         Whether to condition VelocityNet on the current absolute age.
     """
@@ -136,13 +135,13 @@ class LongitudinalODERegistration(nn.Module):
         ode_func = ODEFunction(
             self.velocity_net, imageA, imageB, ages[0], ages_target
         )
-        # Only deformation coordinates participate in adaptive error control.
+        # Only deformation coordinates participate in ODE integration.
         phi_traj = odeint(
             ode_func, grid, relative_times,
-            method="dopri5", rtol=1e-4, atol=1e-6,
-            options={"first_step": self.step_time},
-            adjoint_method="dopri5", adjoint_rtol=1e-4, adjoint_atol=1e-6,
-            adjoint_options={"first_step": self.step_time},
+            method="rk4",
+            options={"step_size": self.step_time},
+            adjoint_method="rk4",
+            adjoint_options={"step_size": self.step_time},
         )
         # Keep a plain counter dictionary, without registering another copy of
         # the velocity network. The adjoint retains this same RHS/counter.
@@ -239,8 +238,8 @@ class VelocityNet(nn.Module):
     t_dim_enc : int
         Dimensionality of the raw sinusoidal time encoding before the MLP.
     use_absolute_age : bool
-        If true, encode current age, relative position, and both anchor ages.
-        Otherwise encode only relative position and observed age interval.
+        If true, encode current age, relative position, and observed age
+        interval. Otherwise encode only the latter two values.
     """
 
     def __init__(
@@ -271,11 +270,15 @@ class VelocityNet(nn.Module):
         self.decoder_3 = UnetUpBlock(
             in_channels=32, out_channels=16, kernel_size=3, t_dim=self.t_dim
         )
-        if t_dim_enc < 2 or t_dim_enc % 2:
-            raise ValueError("t_dim_enc must be a positive even integer >= 2")
-        self.time_embedding = SinusoidalPositionEmbeddings(t_dim_enc)
+        self.temp_enc = SinusoidalPositionEmbeddings(
+            self.t_dim_enc, max_periods=100
+        )
         self.time_mlp = nn.Sequential(
-            nn.Linear((4 if use_absolute_age else 2) * t_dim_enc, self.t_dim),
+            nn.Linear(
+                (3 if use_absolute_age else 2) * self.t_dim_enc,
+                self.t_dim,
+                bias=True,
+            ),
             nn.SiLU(),
             nn.Linear(self.t_dim, self.t_dim, bias=True),
             nn.SiLU(),
@@ -340,17 +343,15 @@ class VelocityNet(nn.Module):
             ageB = ageB.expand(B)
 
         current_age = t  # Globally normalised dataset age.
-        interval = ageB - ageA
-        alpha = (current_age - ageA) / interval
-
+        anchor_interval = ageB - ageA
+        if torch.any(anchor_interval == 0):
+            raise ValueError("anchor ages must differ to compute relative position")
+        alpha = (current_age - ageA) / anchor_interval
+        temporal_inputs = [alpha, anchor_interval]
         if self.use_absolute_age:
-            temporal_inputs = torch.stack([current_age, alpha, ageA, ageB], dim=1)
-        else:
-            temporal_inputs = torch.stack([alpha, interval], dim=1)
-        encoded_times = self.time_embedding(
-            temporal_inputs.reshape(-1)
-        ).reshape(B, -1)
-        t_all = self.time_mlp(encoded_times)
+            temporal_inputs.insert(0, current_age)
+        t_all = torch.cat([self.temp_enc(value) for value in temporal_inputs], dim=1)
+        t_all = self.time_mlp(t_all)
         feat_maps = self.encoder(net_input, t_all)
         v = self.decoder_0(feat_maps[4], feat_maps[3], t_all)
         v = self.decoder_1(v, feat_maps[2], t_all)
