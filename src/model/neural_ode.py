@@ -15,15 +15,14 @@ implement a continuous-time deformable registration pipeline:
 
 2. **ODEFunction** – wraps :class:`VelocityNet` as the right-hand side
    ``f(t, φ_t)`` of the neural ODE ``dφ/dt = v(t, φ_t)``.  At each
-   solver evaluation it evolves only deformation coordinates. Velocity and
-   Jacobian penalties are evaluated outside the solver at acquisition ages.
+   RK4 evaluation it also accumulates velocity and Jacobian penalties.
 
 3. **LongitudinalODERegistration** – the top-level ``nn.Module`` consumed
    by the Lightning training loop.  It integrates :class:`ODEFunction`
    from *ages[0]* to *ages[-1]* using the fixed-step RK4 solver from
    `torchdiffeq <https://github.com/rtqichen/torchdiffeq>`_ and returns
    the full deformation trajectory (one field per acquisition age) together
-   with external trapezoidal regularisation integrals.
+   with the regularisation integrals accumulated by RK4.
 
 Coordinate convention
 ---------------------
@@ -39,7 +38,6 @@ Author : Florian Scalvini
 import monai
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 from torchdiffeq import odeint_adjoint as odeint
 
 # --- Local ---
@@ -110,7 +108,7 @@ class LongitudinalODERegistration(nn.Module):
             Identity grid of shape ``(B, 3, D, H, W)`` with coordinates in
             ``[-1, 1]``, used as the initial deformation state ``φ₀``.
         loss_v : nn.Module
-            Velocity penalty evaluated at acquisition times outside the ODE
+            Velocity penalty evaluated at every RK4 stage
             (default: :class:`monai.losses.DiffusionLoss` with normalize=True).
 
         Returns
@@ -119,8 +117,8 @@ class LongitudinalODERegistration(nn.Module):
             Deformation field at each integration time, shape
             ``(N, B, 3, D, H, W)``.
         loss_reg : torch.Tensor
-            Positive trapezoidal integral of velocity regularisation over
-            acquisition ages (scalar); Jacobian loss is integrated similarly.
+            Velocity regularisation accumulated during integration (scalar);
+            Jacobian loss is accumulated simultaneously.
         """
         if ages.ndim != 1 or ages.numel() < 2:
             raise ValueError("ages must be a one-dimensional sequence of at least two ages")
@@ -132,12 +130,22 @@ class LongitudinalODERegistration(nn.Module):
         relative_times = (ages - ages[0]) / interval
         if not torch.all(relative_times[1:] > relative_times[:-1]):
             raise ValueError("ages must be strictly ordered in the anchor direction")
+        velocity_loss = self.velocity_loss if loss_v is None else loss_v
         ode_func = ODEFunction(
-            self.velocity_net, imageA, imageB, ages[0], ages_target
+            self.velocity_net,
+            imageA,
+            imageB,
+            ages[0],
+            ages_target,
+            identity_grid=grid,
+            loss_jac=self.jacobian_loss,
+            loss_v=velocity_loss,
         )
-        # Only deformation coordinates participate in ODE integration.
-        phi_traj = odeint(
-            ode_func, grid, relative_times,
+        zero = imageA.new_zeros(())
+        phi_traj, loss_reg_traj, loss_jac_traj = odeint(
+            ode_func,
+            (grid, zero, zero.clone()),
+            relative_times,
             method="rk4",
             options={"step_size": self.step_time},
             adjoint_method="rk4",
@@ -147,36 +155,7 @@ class LongitudinalODERegistration(nn.Module):
         # the velocity network. The adjoint retains this same RHS/counter.
         self.solver_stats = ode_func.solver_stats
         self.solver_stats["forward_nfe"] = self.solver_stats["nfe"]
-        velocity_loss = self.velocity_loss if loss_v is None else loss_v
-
-        def velocity_penalty(phi, age):
-            image_t = registration.warp_with_phi(imageA, phi)
-            velocity = self.velocity_net(age, imageA, image_t, imageB, ages[0], ages_target)
-            return velocity_loss(velocity)
-
-        def jacobian_penalty(phi):
-            displacement = registration.phi_to_displacement_voxel(phi, grid)
-            return self.jacobian_loss(displacement)
-
-        # Recompute scalar penalties during backward instead of retaining a
-        # complete U-Net activation graph for every acquisition time.
-        use_checkpoint = self.training and torch.is_grad_enabled()
-        reg_values, jac_values = [], []
-        for phi, age in zip(phi_traj, ages):
-            if use_checkpoint:
-                reg_values.append(checkpoint(velocity_penalty, phi, age, use_reentrant=False))
-                jac_values.append(checkpoint(jacobian_penalty, phi, use_reentrant=False))
-            else:
-                reg_values.append(velocity_penalty(phi, age))
-                jac_values.append(jacobian_penalty(phi))
-        # Positive trapezoidal weights preserve duration scaling and support
-        # irregular acquisition ages in either chronological direction.
-        widths = (ages[1:] - ages[:-1]).abs()
-        reg_values = torch.stack(reg_values)
-        jac_values = torch.stack(jac_values)
-        loss_reg = (0.5 * (reg_values[1:] + reg_values[:-1]) * widths).sum()
-        loss_jac = (0.5 * (jac_values[1:] + jac_values[:-1]) * widths).sum()
-        return phi_traj, loss_reg, loss_jac
+        return phi_traj, loss_reg_traj[-1], loss_jac_traj[-1]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -184,13 +163,19 @@ class LongitudinalODERegistration(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ODEFunction(nn.Module):
-    """Deformation-only right-hand side in relative anchor time.
+    """Deformation and regularisation right-hand side in relative anchor time."""
 
-    Penalties are evaluated on the returned trajectory by the registration
-    model. The forward solver state contains no penalty accumulators.
-    """
-
-    def __init__(self, vnet, imageA, imageB, ageA, ageB) -> None:
+    def __init__(
+        self,
+        vnet: nn.Module,
+        imageA: torch.Tensor,
+        imageB: torch.Tensor,
+        ageA: torch.Tensor,
+        ageB: torch.Tensor,
+        identity_grid: torch.Tensor,
+        loss_jac: nn.Module,
+        loss_v: nn.Module,
+    ) -> None:
         super().__init__()
         self.vnet = vnet
         self.imageA = imageA
@@ -198,16 +183,31 @@ class ODEFunction(nn.Module):
         self.ageA = ageA
         self.ageB = ageB
         self.interval = ageB - ageA
+        self.identity_grid = identity_grid
+        self.loss_v = loss_v
+        self.loss_jac = loss_jac
         self.solver_stats = {"nfe": 0}
 
-    def forward(self, t: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        t: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self.solver_stats["nfe"] += 1
+        phi = state[0]
         current_age = self.ageA + t * self.interval
         image_t = registration.warp_with_phi(self.imageA, phi)
         velocity = self.vnet(
             current_age, self.imageA, image_t, self.imageB, self.ageA, self.ageB
         )
-        return registration.sample_vector_field(velocity, phi) * self.interval
+        dphi = registration.sample_vector_field(velocity, phi)
+        loss_reg = self.loss_v(velocity)
+        displacement = registration.phi_to_displacement_voxel(
+            phi, self.identity_grid
+        )
+        loss_jac = self.loss_jac(displacement)
+        duration = self.interval.abs()
+        return dphi * self.interval, loss_reg * duration, loss_jac * duration
 
 
 # ──────────────────────────────────────────────────────────────────────────────
