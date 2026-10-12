@@ -161,7 +161,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.0005,
+        default=0.01,
         help="Optimizer learning rate.",
     )
     parser.add_argument(

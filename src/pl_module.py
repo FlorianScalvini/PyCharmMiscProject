@@ -115,11 +115,14 @@ class RegistrationLongitudinal(pl.LightningModule):
     #  Training
     # ──────────────────────────────────────────────────────────────────────────
 
-    def configure_optimizers(self) -> tuple[list, list]:
-        """Return Adam with exponential learning-rate decay."""
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, amsgrad=True)
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.995)
-        return [optimizer], [scheduler]
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        """Return SGD with momentum and Nesterov acceleration."""
+        return torch.optim.SGD(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            momentum=0.9,
+            nesterov=True,
+        )
 
     def training_step(self, batch: tuple, _) -> None:
         """Compute total weighted loss, back-propagate, and log per-term metrics."""
@@ -243,7 +246,6 @@ class RegistrationLongitudinal(pl.LightningModule):
         optimizer.step() # type: ignore
         diagnostics.update(optimizer_step_metrics(optimizer, parameters, before_update, loss))
         del before_update
-        self.lr_schedulers().step()
         self.log_dict({
             f"train/diagnostics/{name}": value for name, value in diagnostics.items()
         }, on_step=True, on_epoch=False, prog_bar=False, batch_size=1)
