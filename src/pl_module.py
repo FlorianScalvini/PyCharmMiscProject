@@ -51,6 +51,7 @@ class RegistrationLongitudinal(pl.LightningModule):
         shape: list[int] = [192, 224, 192],
         step_time: float | None = None,
         use_absolute_age: bool = True,
+        velocity_smoothing_sigma: float = 1.0,
         random_target: bool = False,
         diagnostic_every_n_steps: int = 50,
         *args,
@@ -66,6 +67,7 @@ class RegistrationLongitudinal(pl.LightningModule):
             shape=shape,
             step_time=0.05 if step_time is None else step_time,
             use_absolute_age=use_absolute_age,
+            velocity_smoothing_sigma=velocity_smoothing_sigma,
         )
 
         # Hyperparameters
@@ -116,12 +118,12 @@ class RegistrationLongitudinal(pl.LightningModule):
     # ──────────────────────────────────────────────────────────────────────────
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        """Return SGD with momentum and Nesterov acceleration."""
-        return torch.optim.SGD(
+        """Return AMSGrad Adam with a larger epsilon for stable updates."""
+        return torch.optim.Adam(
             self.model.parameters(),
             lr=self.learning_rate,
-            momentum=0.9,
-            nesterov=True,
+            eps=1e-6,
+            amsgrad=True,
         )
 
     def training_step(self, batch: tuple, _) -> None:

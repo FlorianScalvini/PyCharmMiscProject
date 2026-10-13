@@ -42,7 +42,7 @@ def compute_jacobian_determinant_3d(displacement, spacing=(1.0, 1.0, 1.0)):
 
     jacobian = torch.stack([torch.stack(grad_k, dim=-1) for grad_k in grads], dim=-1)
     # Add identity to convert ∂φ/∂x = I + ∂u/∂x
-    identity = torch.eye(3).to(displacement.device)
+    identity = torch.eye(3, device=displacement.device, dtype=displacement.dtype)
     jacobian = jacobian + identity
     # Explicit 3x3 determinant keeps cofactor gradients at singular matrices.
     # In particular, collapsing one axis must still receive a folding gradient.
@@ -60,4 +60,3 @@ def normalize_to_0_1(volume):
     max_val = volume.max()
     min_val = volume.min()
     return (volume - min_val) / (max_val - min_val)
-

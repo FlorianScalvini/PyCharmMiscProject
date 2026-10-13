@@ -100,6 +100,8 @@ def parse_args() -> Namespace:
             Save a checkpoint every N training steps.
         gradient_clip_norm : float
             Maximum gradient norm; zero disables gradient clipping.
+        velocity_smoothing_sigma : float
+            Gaussian velocity smoothing standard deviation in voxels.
     """
     parser = argparse.ArgumentParser(
         description="Train the longitudinal brain MRI registration model."
@@ -138,7 +140,6 @@ def parse_args() -> Namespace:
         default=1,
         help="Number of devices used by Lightning (use 4 for one four-GPU DDP job).",
     )
-
     # --- Training ---
     parser.add_argument(
         "--use_augmentation",
@@ -161,7 +162,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.01,
+        default=0.0005,
         help="Optimizer learning rate.",
     )
     parser.add_argument(
@@ -169,6 +170,12 @@ def parse_args() -> Namespace:
         type=float,
         default=.5,
         help="Maximum gradient norm (0 disables clipping).",
+    )
+    parser.add_argument(
+        "--velocity_smoothing_sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian velocity smoothing sigma in voxels (0 disables smoothing).",
     )
     parser.add_argument(
         "--lambda_seg",
@@ -190,13 +197,13 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lambda_reg",
         type=float,
-        default=0.0004,
+        default=1,
         help="Weight for the regularisation loss term.",
     )
     parser.add_argument(
         "--lambda_jac",
         type=float,
-        default=10,
+        default=8,
         help="Weight for the Jacobian-determinant loss term.",
     )
     parser.add_argument(
@@ -228,6 +235,8 @@ def parse_args() -> Namespace:
     args = parser.parse_args()
     if args.diagnostic_every_n_steps < 0:
         parser.error("--diagnostic_every_n_steps must be nonnegative")
+    if args.velocity_smoothing_sigma < 0:
+        parser.error("--velocity_smoothing_sigma must be nonnegative")
     for name in ("devices", "max_steps", "val_every_n_steps", "checkpoint_every_n_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
@@ -305,6 +314,7 @@ def main(args: Namespace) -> None:
         gradient_clip_norm=args.gradient_clip_norm,
         shape=config["rsize"],
         use_absolute_age=config.get("use_absolute_age", False),
+        velocity_smoothing_sigma=args.velocity_smoothing_sigma,
         random_target=args.random_target,
         diagnostic_every_n_steps=args.diagnostic_every_n_steps,
     )
@@ -335,7 +345,11 @@ def main(args: Namespace) -> None:
         enable_progress_bar=True,
     )
     #training_module.model.load_state_dict(torch.load("/home/florian/PyCharmMiscProject/results/babofet/train/26_21_11_14/last_registration.pt"))
-    trainer.fit(model=training_module, datamodule=datamodule, ckpt_path=args.checkpoint if args.checkpoint is not None else None)
+    trainer.fit(
+        model=training_module,
+        datamodule=datamodule,
+        ckpt_path=args.checkpoint if args.checkpoint is not None else None,
+    )
 
 
 if __name__ == "__main__":

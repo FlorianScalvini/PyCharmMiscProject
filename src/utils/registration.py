@@ -25,6 +25,7 @@ Author : Florian Scalvini
 
 # --- Standard library ---
 from collections.abc import Sequence
+import math
 
 # --- Third-party ---
 import torch
@@ -105,6 +106,44 @@ def sample_vector_field(vector_field: Tensor, phi: Tensor) -> Tensor:
             f"{tuple(vector_field.shape)} and {tuple(phi.shape)}"
         )
     return warp_with_phi(vector_field, phi)
+
+
+def gaussian_smooth_3d(field: Tensor, sigma: float = 1.0) -> Tensor:
+    """Smooth a 3-D multi-channel field with a separable Gaussian kernel.
+
+    Replicate padding avoids introducing artificial zero velocities at the
+    volume boundary. A non-positive sigma disables smoothing.
+    """
+    if field.ndim != 5:
+        raise ValueError(f"expected field (B,C,D,H,W), got {tuple(field.shape)}")
+    if sigma <= 0:
+        return field
+
+    radius = max(1, math.ceil(2.0 * sigma))
+    coordinates = torch.arange(
+        -radius,
+        radius + 1,
+        device=field.device,
+        dtype=torch.float32,
+    )
+    kernel = torch.exp(-0.5 * (coordinates / sigma).square())
+    kernel = (kernel / kernel.sum()).to(dtype=field.dtype)
+    channels = field.shape[1]
+
+    kernels_and_padding = (
+        (kernel.view(1, 1, -1, 1, 1), (0, 0, 0, 0, radius, radius)),
+        (kernel.view(1, 1, 1, -1, 1), (0, 0, radius, radius, 0, 0)),
+        (kernel.view(1, 1, 1, 1, -1), (radius, radius, 0, 0, 0, 0)),
+    )
+    smoothed = field
+    for axis_kernel, padding in kernels_and_padding:
+        smoothed = F.pad(smoothed, padding, mode="replicate")
+        smoothed = F.conv3d(
+            smoothed,
+            axis_kernel.expand(channels, 1, *axis_kernel.shape[2:]),
+            groups=channels,
+        )
+    return smoothed
 
 
 def warp_with_phi(image: Tensor, phi: Tensor, mode: str = "bilinear") -> Tensor:

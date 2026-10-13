@@ -10,8 +10,8 @@ implement a continuous-time deformable registration pipeline:
    concatenation of the source image, the currently warped image, and the
    target image as input and predicts a dense 3-D velocity field ``v(t)``.
    Current age, relative position between the anchors, and their age
-   interval are encoded with sinusoidal embeddings and injected into every
-   encoder / decoder block through a shared time MLP.
+   interval are projected by a shared MLP and injected into every encoder /
+   decoder block.
 
 2. **ODEFunction** – wraps :class:`VelocityNet` as the right-hand side
    ``f(t, φ_t)`` of the neural ODE ``dφ/dt = v(t, φ_t)``.  At each
@@ -44,7 +44,6 @@ from torchdiffeq import odeint_adjoint as odeint
 import utils.registration as registration
 import utils.losses as losses
 from .unet import EncoderUnet, UnetUpBlock
-from .time_encoding import SinusoidalPositionEmbeddings
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,6 +67,9 @@ class LongitudinalODERegistration(nn.Module):
         the forward and adjoint solves.
     use_absolute_age : bool
         Whether to condition VelocityNet on the current absolute age.
+    velocity_smoothing_sigma : float
+        Standard deviation, in voxels, of the Gaussian filter applied to the
+        velocity before composition and regularisation. Set to zero to disable.
     """
 
     def __init__(
@@ -75,6 +77,7 @@ class LongitudinalODERegistration(nn.Module):
         shape: list[int] = [192, 224, 192],
         step_time: float = 0.05,
         use_absolute_age: bool = True,
+        velocity_smoothing_sigma: float = 1.0,
     ) -> None:
         super().__init__()
         self.velocity_net = VelocityNet(shape=shape, use_absolute_age=use_absolute_age)
@@ -82,7 +85,10 @@ class LongitudinalODERegistration(nn.Module):
         self.velocity_loss = monai.losses.DiffusionLoss(normalize=True)
         if step_time <= 0:
             raise ValueError("step_time must be positive")
+        if velocity_smoothing_sigma < 0:
+            raise ValueError("velocity_smoothing_sigma must be non-negative")
         self.step_time = step_time
+        self.velocity_smoothing_sigma = velocity_smoothing_sigma
 
     def forward(
         self,
@@ -140,6 +146,7 @@ class LongitudinalODERegistration(nn.Module):
             identity_grid=grid,
             loss_jac=self.jacobian_loss,
             loss_v=velocity_loss,
+            velocity_smoothing_sigma=self.velocity_smoothing_sigma,
         )
         zero = imageA.new_zeros(())
         phi_traj, loss_reg_traj, loss_jac_traj = odeint(
@@ -175,6 +182,7 @@ class ODEFunction(nn.Module):
         identity_grid: torch.Tensor,
         loss_jac: nn.Module,
         loss_v: nn.Module,
+        velocity_smoothing_sigma: float,
     ) -> None:
         super().__init__()
         self.vnet = vnet
@@ -186,6 +194,7 @@ class ODEFunction(nn.Module):
         self.identity_grid = identity_grid
         self.loss_v = loss_v
         self.loss_jac = loss_jac
+        self.velocity_smoothing_sigma = velocity_smoothing_sigma
         self.solver_stats = {"nfe": 0}
 
     def forward(
@@ -197,11 +206,16 @@ class ODEFunction(nn.Module):
         phi = state[0]
         current_age = self.ageA + t * self.interval
         image_t = registration.warp_with_phi(self.imageA, phi)
-        velocity = self.vnet(
+        raw_velocity = self.vnet(
             current_age, self.imageA, image_t, self.imageB, self.ageA, self.ageB
         )
+        velocity = registration.gaussian_smooth_3d(
+            raw_velocity, sigma=self.velocity_smoothing_sigma
+        )
         dphi = registration.sample_vector_field(velocity, phi)
-        loss_reg = self.loss_v(velocity)
+        # Penalise the unfiltered prediction so the network cannot hide
+        # high-frequency variations upstream of the Gaussian filter.
+        loss_reg = self.loss_v(raw_velocity)
         displacement = registration.phi_to_displacement_voxel(
             phi, self.identity_grid
         )
@@ -223,9 +237,9 @@ class VelocityNet(nn.Module):
 
     Current age, relative position
     ``alpha = (t - ageA) / (ageB - ageA)``, and observed age interval
-    ``ageB - ageA`` are mapped through sinusoidal embeddings and a 3-layer
-    SiLU MLP. The resulting vector is injected into every encoder and
-    decoder block via feature-wise modulation.
+    ``ageB - ageA`` are mapped directly through a 3-layer SiLU MLP. The
+    resulting vector is injected into every encoder and decoder block via
+    feature-wise modulation.
 
     Parameters
     ----------
@@ -235,8 +249,6 @@ class VelocityNet(nn.Module):
         Spatial dimensions ``[H, W, D]`` of the input volumes.
     t_dim : int
         Dimensionality of the time embedding fed to the U-Net blocks.
-    t_dim_enc : int
-        Dimensionality of the raw sinusoidal time encoding before the MLP.
     use_absolute_age : bool
         If true, encode current age, relative position, and observed age
         interval. Otherwise encode only the latter two values.
@@ -247,12 +259,10 @@ class VelocityNet(nn.Module):
         reg_head_chan: int = 16,
         shape: list[int] = [192, 224, 192],
         t_dim: int = 48,
-        t_dim_enc: int = 16,
         use_absolute_age: bool = True,
     ) -> None:
         super().__init__()
         self.shape = shape
-        self.t_dim_enc = t_dim_enc
         self.t_dim = t_dim
         self.use_absolute_age = use_absolute_age
         self.encoder = EncoderUnet(
@@ -270,12 +280,9 @@ class VelocityNet(nn.Module):
         self.decoder_3 = UnetUpBlock(
             in_channels=32, out_channels=16, kernel_size=3, t_dim=self.t_dim
         )
-        self.temp_enc = SinusoidalPositionEmbeddings(
-            self.t_dim_enc, max_periods=100
-        )
         self.time_mlp = nn.Sequential(
             nn.Linear(
-                (3 if use_absolute_age else 2) * self.t_dim_enc,
+                3 if use_absolute_age else 2,
                 self.t_dim,
                 bias=True,
             ),
@@ -350,7 +357,7 @@ class VelocityNet(nn.Module):
         temporal_inputs = [alpha, anchor_interval]
         if self.use_absolute_age:
             temporal_inputs.insert(0, current_age)
-        t_all = torch.cat([self.temp_enc(value) for value in temporal_inputs], dim=1)
+        t_all = torch.stack(temporal_inputs, dim=1)
         t_all = self.time_mlp(t_all)
         feat_maps = self.encoder(net_input, t_all)
         v = self.decoder_0(feat_maps[4], feat_maps[3], t_all)
